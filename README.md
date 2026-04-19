@@ -13,7 +13,10 @@ A clean, native Mumble client for macOS — built with SwiftUI.
 
 ## Screenshots
 
-*Coming soon — drop your screenshots here*
+| | |
+|---|---|
+| ![Home](Screenshots/home.png) | ![Connected](Screenshots/connected.png) |
+| ![Add Server](Screenshots/add-server.png) | ![Settings](Screenshots/settings.png) |
 
 ---
 
