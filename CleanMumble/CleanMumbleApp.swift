@@ -6,9 +6,15 @@
 //
 
 import SwiftUI
+import AVFoundation
 
 @main
 struct CleanMumbleApp: App {
+
+    init() {
+        AVCaptureDevice.requestAccess(for: .audio) { _ in }
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
