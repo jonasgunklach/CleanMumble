@@ -68,6 +68,86 @@ struct AddServerView: View {
     }
 }
 
+// MARK: - Edit Server sheet
+
+struct EditServerView: View {
+    @Environment(\..dismiss) private var dismiss
+    @EnvironmentObject var viewModel: MumbleViewModel
+
+    let server: ServerConnectionInfo
+
+    @State private var name: String
+    @State private var host: String
+    @State private var port: String
+    @State private var username: String
+    @State private var password: String
+    @State private var isFavorite: Bool
+
+    init(server: ServerConnectionInfo) {
+        self.server = server
+        _name       = State(initialValue: server.name)
+        _host       = State(initialValue: server.host)
+        _port       = State(initialValue: String(server.port))
+        _username   = State(initialValue: server.username)
+        _password   = State(initialValue: server.password)
+        _isFavorite = State(initialValue: server.isFavorite)
+    }
+
+    private var canSave: Bool { !name.isEmpty && !host.isEmpty && !username.isEmpty }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Form {
+                Section("Server") {
+                    TextField("Name", text: $name)
+                    TextField("Host", text: $host)
+                        .textContentType(.URL)
+                    TextField("Port", text: $port)
+                }
+                Section("Account") {
+                    TextField("Username", text: $username)
+                    SecureField("Password (optional)", text: $password)
+                    Toggle("Favorite", isOn: $isFavorite)
+                }
+            }
+            .formStyle(.grouped)
+            .scrollDisabled(true)
+
+            Divider()
+
+            HStack {
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Save") { saveServer() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canSave)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+        }
+        .frame(width: 360)
+        .navigationTitle("Edit Server")
+    }
+
+    private func saveServer() {
+        var updated = server
+        updated.name       = name
+        updated.host       = host
+        updated.port       = Int(port) ?? 64738
+        updated.username   = username
+        updated.password   = password
+        updated.isFavorite = isFavorite
+        viewModel.updateServer(updated)
+        // If editing the currently-active server, refresh currentServer so the
+        // sidebar header and audio strip reflect the new name/username.
+        if viewModel.currentServer?.id == server.id {
+            viewModel.currentServer = updated
+        }
+        dismiss()
+    }
+}
+
 // MARK: - Legacy views kept for compatibility
 
 struct ServerRowView: View {

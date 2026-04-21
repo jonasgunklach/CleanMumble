@@ -135,6 +135,7 @@ struct SidebarView: View {
 struct ServerSidebarRow: View {
     let server: ServerConnectionInfo
     @EnvironmentObject var viewModel: MumbleViewModel
+    @State private var showEdit = false
 
     private var isActive: Bool {
         viewModel.isConnected && viewModel.currentServer?.id == server.id
@@ -174,6 +175,9 @@ struct ServerSidebarRow: View {
                 }
             }
             Divider()
+            Button { showEdit = true } label: {
+                Label("Edit", systemImage: "pencil")
+            }
             Button { viewModel.toggleFavorite(server) } label: {
                 Label(server.isFavorite ? "Remove Favorite" : "Mark as Favorite",
                       systemImage: server.isFavorite ? "star.slash" : "star")
@@ -181,6 +185,10 @@ struct ServerSidebarRow: View {
             Button(role: .destructive) { viewModel.removeServer(server) } label: {
                 Label("Remove", systemImage: "trash")
             }
+        }
+        .sheet(isPresented: $showEdit) {
+            EditServerView(server: server)
+                .environmentObject(viewModel)
         }
     }
 }

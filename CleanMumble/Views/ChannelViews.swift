@@ -84,9 +84,10 @@ struct ChannelRowView: View {
             }
             
             Spacer()
-            
-            if channel.userCount > 0 {
-                Text("\(channel.userCount)")
+
+            let liveCount = viewModel.users.filter { $0.currentChannelId == channel.channelId }.count
+            if liveCount > 0 {
+                Text("\(liveCount)")
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .padding(.horizontal, 6)
@@ -161,16 +162,22 @@ struct UserRowView: View {
     
     var body: some View {
         HStack {
-            // Avatar placeholder
+            // Avatar with speaking indicator ring
             Circle()
-                .fill(Color.accentColor.opacity(0.3))
+                .fill(user.isSpeaking ? Color.green.opacity(0.25) : Color.accentColor.opacity(0.3))
                 .frame(width: 32, height: 32)
                 .overlay(
                     Text(String(user.name.prefix(1)).uppercased())
                         .font(.caption)
                         .fontWeight(.semibold)
-                        .foregroundColor(.accentColor)
+                        .foregroundColor(user.isSpeaking ? .green : .accentColor)
                 )
+                .overlay(
+                    Circle()
+                        .strokeBorder(Color.green, lineWidth: 2)
+                        .opacity(user.isSpeaking ? 1 : 0)
+                )
+                .animation(.easeInOut(duration: 0.2), value: user.isSpeaking)
             
             VStack(alignment: .leading, spacing: 2) {
                 Text(user.name)

@@ -123,6 +123,12 @@ extension Data {
         append(bytes)
     }
 
+    mutating func pbBytes(field: UInt32, value: Data) {
+        pbVarint(UInt64((field << 3) | 2))
+        pbVarint(UInt64(value.count))
+        append(value)
+    }
+
     /// Mumble TCP frame header: [type: u16 BE][length: u32 BE].
     mutating func mumbleHeader(type: UInt16, length: UInt32) {
         var t = type.bigEndian;   append(Data(bytes: &t, count: 2))
@@ -171,15 +177,20 @@ class RealMumbleClient: ObservableObject {
     @Published var audioOutputLevel: Float = 0.0
     @Published var isSpeaking: Bool = false
 
-    // MARK: Audio engine
+    // MARK: Server capabilities (set from Version message)
+    /// `true` once the server has announced version ≥ 1.5; drives audio format choice.
+    private var serverUseProtobufAudio: Bool = false
 
     private var audioEngine: AVAudioEngine?
     private var playerNode: AVAudioPlayerNode?
     private var opusEncoder: Opus.Encoder?
-    private var opusDecoder: Opus.Decoder?
+    /// Per-speaker Opus decoders, keyed by sender session ID.
+    /// Each remote user must have their own decoder context so the LPC
+    /// predictor state for one speaker doesn't corrupt another speaker's audio.
+    private var opusDecoders: [Int32: Opus.Decoder] = [:]
     private var opusConverter: AVAudioConverter?
-    /// Raw C pointer to the Opus encoder state (for opus_encoder_ctl calls).
-    private var opusEncoderPtr: OpaquePointer?
+    private var audioStartAttempts: Int = 0
+    private var udpAudioPacketCount: Int = 0
     /// UIDs of preferred audio devices ("Default" = system default).
     var inputDeviceUID:  String = "Default"
     var outputDeviceUID: String = "Default"
@@ -191,6 +202,14 @@ class RealMumbleClient: ObservableObject {
     private var opusFrameSize: AVAudioFrameCount { AVAudioFrameCount(opusFrameMs * 48) }
     /// Monotonically increasing sequence number for outgoing audio packets.
     private var audioSequence: UInt64 = 0
+    /// Timers to reset remote users' isSpeaking after audio stops arriving.
+    private var speakingTimers: [Int32: Timer] = [:]
+    /// Accumulates 48 kHz mono float32 samples until we have a full Opus frame.
+    private var pcmAccumulator: [Float] = []
+    /// Counts consecutive silent frames; resets on speech. Used for VAD hold-off.
+    private var silenceHoldCount: Int = 0
+    /// Number of silent frames to hold before declaring end-of-speech (~300 ms at 20 ms/frame).
+    private let silenceHoldFrames = 15
     /// 48 kHz mono float32 format used for both capture and playback.
     private let opusFormat = AVAudioFormat(opusPCMFormat: .float32, sampleRate: 48000, channels: 1)!
 
@@ -270,6 +289,8 @@ class RealMumbleClient: ObservableObject {
 
     func disconnect() {
         pingTimer?.invalidate(); pingTimer = nil
+        speakingTimers.values.forEach { $0.invalidate() }
+        speakingTimers.removeAll()
         stopAudioEngine()
         connection?.cancel();    connection  = nil
         rxBuffer  = []
@@ -396,15 +417,21 @@ class RealMumbleClient: ObservableObject {
     // ─────────────────────────────────────────────────────────────────────────
 
     private func onVersion(_ payload: Data) {
-        var release = ""; var os = ""
+        var release = ""; var os = ""; var versionV1: UInt32 = 0
         for f in decodeProto(payload) {
             switch f.field {
+            case 1: if case .varint(let v) = f.val { versionV1 = UInt32(v) }
             case 2: if case .bytes(let d) = f.val { release = str(d) }
             case 3: if case .bytes(let d) = f.val { os      = str(d) }
             default: break
             }
         }
-        print("[Mumble] Server version: \(release) / \(os)")
+        // version_v1 encoding: (major << 16) | (minor << 8) | patch
+        // 1.5.0 = 0x00010500 = 66816
+        serverUseProtobufAudio = versionV1 >= 0x00010500
+        let major = (versionV1 >> 16) & 0xFF
+        let minor = (versionV1 >>  8) & 0xFF
+        print("[Mumble] Server version: \(major).\(minor) (\(release) / \(os)) — audio: \(serverUseProtobufAudio ? "protobuf" : "legacy")")
     }
 
     private func onPing(_ payload: Data) {
@@ -503,7 +530,7 @@ class RealMumbleClient: ObservableObject {
 
     private func onUserState(_ payload: Data) {
         let fields = decodeProto(payload)
-        var session: UInt32?; var name = ""; var cid: UInt32 = 0
+        var session: UInt32?; var name = ""; var cid: UInt32 = 0; var hasCid = false
         var mute = false; var deaf = false; var suppress = false
         var selfMute = false; var selfDeaf = false
         var priority = false; var recording = false; var comment: String?
@@ -512,7 +539,7 @@ class RealMumbleClient: ObservableObject {
             switch f.field {
             case  1: if case .varint(let v) = f.val { session   = UInt32(v) }
             case  3: if case .bytes(let d)  = f.val { name      = str(d) }
-            case  5: if case .varint(let v) = f.val { cid       = UInt32(v) }
+            case  5: if case .varint(let v) = f.val { cid       = UInt32(v); hasCid = true }
             case  6: if case .varint(let v) = f.val { mute      = v != 0 }
             case  7: if case .varint(let v) = f.val { deaf      = v != 0 }
             case  8: if case .varint(let v) = f.val { suppress  = v != 0 }
@@ -529,7 +556,7 @@ class RealMumbleClient: ObservableObject {
         if let i = users.firstIndex(where: { $0.userId == Int32(session) }) {
             var u = users[i]
             if !name.isEmpty    { u.name            = name }
-            u.currentChannelId  = Int32(cid)
+            if hasCid           { u.currentChannelId = Int32(cid) }
             u.isMuted           = mute
             u.isDeafened        = deaf
             u.isSuppressed      = suppress
@@ -544,7 +571,7 @@ class RealMumbleClient: ObservableObject {
                              name: name.isEmpty ? "User \(session)" : name,
                              isMuted: mute,
                              isDeafened: deaf)
-            u.currentChannelId  = Int32(cid)
+            u.currentChannelId  = Int32(cid)   // default 0 is correct for new users
             u.isSuppressed      = suppress
             u.isSelfMuted       = selfMute
             u.isSelfDeafened    = selfDeaf
@@ -557,7 +584,7 @@ class RealMumbleClient: ObservableObject {
         if session == sessionId {
             isMuted    = selfMute || mute
             isDeafened = selfDeaf || deaf
-            if let ch = channels.first(where: { $0.channelId == Int32(cid) }) {
+            if hasCid, let ch = channels.first(where: { $0.channelId == Int32(cid) }) {
                 currentChannel = ch
             }
         }
@@ -587,39 +614,120 @@ class RealMumbleClient: ObservableObject {
     }
 
     /// Handle incoming UDPTunnel (type 1) audio packets from the server.
-    /// Mumble audio packet inside UDPTunnel:
+    /// Mumble audio packet inside UDPTunnel (server → client):
     ///   [1-byte header] = (codec << 5) | target
+    ///   Mumble VarInt: sender session ID  (prepended by server)
     ///   Mumble VarInt: sequence number
-    ///   Mumble VarInt: length (with optional end-of-transmission bit 13)
+    ///   Mumble VarInt: opus length (bit 13 = end-of-transmission flag)
     ///   [opus bytes]
     private func onUDPTunnel(_ payload: Data) {
+        udpAudioPacketCount += 1
+        if udpAudioPacketCount <= 3 {
+            print("[Audio] UDPTunnel packet #\(udpAudioPacketCount) (\(payload.count) bytes, header=0x\(String(payload[0], radix: 16)))")
+        }
         guard payload.count > 1 else { return }
         let header = payload[0]
-        let codec  = (header >> 5) & 0x07   // 4 = Opus
-        guard codec == 4 else { return }    // ignore non-Opus
+        let codec  = (header >> 5) & 0x07
 
-        var pos = 1
-        // Read Mumble VarInt for sequence
-        guard let (_, seqLen) = readMumbleVarInt(payload, at: pos) else { return }
-        pos += seqLen
-        // Read Mumble VarInt for length (bit 13 = end-of-transmission flag)
-        guard let (rawLen, lenLen) = readMumbleVarInt(payload, at: pos) else { return }
-        pos += lenLen
-        let opusLen = Int(rawLen & ~(1 << 13))   // strip end-of-stream bit
-        guard opusLen > 0, pos + opusLen <= payload.count else { return }
-
-        let opusBytes = payload.subdata(in: pos..<(pos + opusLen))
-        decodeAndPlay(opusBytes)
+        switch codec {
+        case 4:  // Legacy Opus: [header][session varint][seq varint][len varint][opus bytes]
+            parseLegacyUDPAudio(payload)
+        case 0:  // Protobuf v2: [header][MumbleUDP.Audio protobuf bytes]
+            parseProtobufUDPAudio(payload)
+        default:
+            if udpAudioPacketCount <= 3 { print("[Audio] Unknown codec \(codec) in UDPTunnel") }
+        }
     }
 
-    private func decodeAndPlay(_ opusBytes: Data) {
-        guard !isDeafened, let decoder = opusDecoder,
-              let player = playerNode, let engine = audioEngine,
-              engine.isRunning else { return }
+    private func parseLegacyUDPAudio(_ payload: Data) {
+        var pos = 1
+        guard let (senderSession, sessionLen) = readMumbleVarInt(payload, at: pos) else { return }
+        pos += sessionLen
+        guard let (_, seqLen) = readMumbleVarInt(payload, at: pos) else { return }
+        pos += seqLen
+        guard let (rawLen, lenLen) = readMumbleVarInt(payload, at: pos) else { return }
+        pos += lenLen
+        let isTerminator = (rawLen & (1 << 13)) != 0
+        let opusLen = Int(rawLen & ~(1 << 13))
+        if isTerminator {
+            opusDecoders[Int32(senderSession)] = nil  // discard so next utterance gets a fresh decoder
+            return
+        }
+        guard opusLen > 0, pos + opusLen <= payload.count else { return }
+        let opusBytes = payload.subdata(in: pos..<(pos + opusLen))
+        markUserSpeaking(Int32(senderSession))
+        decodeAndPlay(opusBytes, sender: Int32(senderSession))
+    }
+
+    private func parseProtobufUDPAudio(_ payload: Data) {
+        // byte 0 = header; bytes 1+ = protobuf MumbleUDP.Audio
+        guard payload.count > 1 else { return }
+        let protoData = payload.subdata(in: 1..<payload.count)
+        var senderSession: UInt32 = 0
+        var opusData: Data? = nil
+        var isTerminator = false
+        for f in decodeProto(protoData) {
+            switch f.field {
+            case 3: if case .varint(let v) = f.val { senderSession = UInt32(v) }
+            case 5: if case .bytes(let d)  = f.val { opusData = d }
+            case 8: if case .varint(let v) = f.val { isTerminator = v != 0 }
+            default: break
+            }
+        }
+        if isTerminator {
+            // Discard this speaker's decoder so the next utterance starts fresh.
+            opusDecoders[Int32(senderSession)] = nil
+            return
+        }
+        guard let opusBytes = opusData, !opusBytes.isEmpty else { return }
+        markUserSpeaking(Int32(senderSession))
+        decodeAndPlay(opusBytes, sender: Int32(senderSession))
+    }
+
+    /// Mark a remote user as speaking and schedule a timer to clear the state.
+    private func markUserSpeaking(_ userId: Int32) {
+        if let i = users.firstIndex(where: { $0.userId == userId }) {
+            if !users[i].isSpeaking {
+                users[i].isSpeaking = true
+            }
+        }
+        // Reset/extend the timer so isSpeaking clears ~400ms after last packet
+        speakingTimers[userId]?.invalidate()
+        speakingTimers[userId] = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let i = self.users.firstIndex(where: { $0.userId == userId }) {
+                    self.users[i].isSpeaking = false
+                }
+                self.speakingTimers.removeValue(forKey: userId)
+            }
+        }
+    }
+
+    private func decodeAndPlay(_ opusBytes: Data, sender: Int32) {
+        guard !isDeafened else {
+            if udpAudioPacketCount < 5 { print("[Audio] Skipped decode: deafened") }
+            return
+        }
+        guard let player = playerNode,
+              let engine = audioEngine, engine.isRunning else {
+            if udpAudioPacketCount < 5 {
+                print("[Audio] Skipped decode: player=\(playerNode != nil) engine.isRunning=\(audioEngine?.isRunning ?? false)")
+            }
+            return
+        }
+        // Get or create a per-speaker decoder so each user has independent LPC state.
+        let decoder: Opus.Decoder
+        if let existing = opusDecoders[sender] {
+            decoder = existing
+        } else {
+            guard let fresh = try? Opus.Decoder(format: opusFormat) else { return }
+            opusDecoders[sender] = fresh
+            decoder = fresh
+        }
         do {
             let pcm = try decoder.decode(opusBytes)
             player.scheduleBuffer(pcm, completionHandler: nil)
-            if !player.isPlaying { player.play() }
         } catch {
             print("[Audio] Decode error: \(error)")
         }
@@ -650,7 +758,8 @@ class RealMumbleClient: ObservableObject {
 
     private func sendVersion() {
         var p = Data()
-        // Version message (Mumble.proto type 0)
+        // Announce 1.5.0 — we now handle both protobuf (type 0) and legacy (type 4)
+        // audio on receive, and pick the correct send format based on the server version.
         p.pbUInt32(field: 1, value: 0x00010500)    // version_v1 = 1.5.0
         p.pbString(field: 2, value: "CleanMumble 1.0")
         #if os(iOS)
@@ -691,8 +800,11 @@ class RealMumbleClient: ObservableObject {
     func toggleMute() {
         isMuted.toggle()
         sendUserState(selfMute: isMuted, selfDeaf: isDeafened)
-        // Tap callback already checks isMuted before encoding, so no extra work.
-        if isMuted { isSpeaking = false; audioInputLevel = 0.0 }
+        if isMuted {
+            isSpeaking = false
+            audioInputLevel = 0.0
+            setLocalUserSpeaking(false)
+        }
     }
 
     func toggleDeafen() {
@@ -777,56 +889,94 @@ class RealMumbleClient: ObservableObject {
         let application: Opus.Application = opusLowDelay ? .restrictedLowDelay : .voip
         do {
             opusEncoder = try Opus.Encoder(format: opusFormat, application: application)
-            opusDecoder = try Opus.Decoder(format: opusFormat)
+            // Decoders are created on-demand per speaker in decodeAndPlay().
+            print("[Audio] Opus encoder ready (frame=\(opusFrameMs)ms / \(opusFrameSize) samples)")
         } catch {
-            print("[Audio] Failed to create Opus codec: \(error)"); return
+            print("[Audio] Failed to create Opus encoder: \(error)"); return
         }
-        // Capture raw encoder pointer for ctl calls by creating our own
-        // (same args) — shares the underlying C state initialisation path.
-        var errCode: Int32 = 0
-        opusEncoderPtr = RealMumbleClient.opus_encoder_create_raw(
-            48000, 1, application.rawValue, &errCode
-        )
-        applyEncoderSettings()
-
         let engine = AVAudioEngine()
         let player = AVAudioPlayerNode()
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: opusFormat)
 
-        let inputNode  = engine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
+        // NOTE: setVoiceProcessingEnabled is intentionally NOT called here.
+        // It creates an AUVPAggregate device incompatible with Bluetooth audio
+        // (AirPods etc.) — produces mic channel count 0 and cascading -10877 errors.
 
-        // Build a single reusable converter from hardware format → 48 kHz mono float32.
-        guard let converter = AVAudioConverter(from: inputFormat, to: opusFormat) else {
-            print("[Audio] Cannot create converter \(inputFormat) → \(opusFormat)"); return
+        // Use the hardware's native format for the tap — passing a mismatched
+        // format crashes with "Failed to create tap due to format mismatch".
+        // We convert to 48 kHz mono float32 ourselves inside the tap block.
+        let hwFormat = engine.inputNode.outputFormat(forBus: 0)
+        print("[Audio] Input HW format: \(hwFormat) | Output HW format: \(engine.outputNode.outputFormat(forBus: 0))")
+        guard hwFormat.sampleRate > 0, hwFormat.channelCount > 0 else {
+            print("[Audio] Input HW format not ready yet — will retry"); return
+        }
+        guard let converter = AVAudioConverter(from: hwFormat, to: opusFormat) else {
+            print("[Audio] Cannot create converter \(hwFormat) → \(opusFormat)"); return
         }
         opusConverter = converter
 
-        inputNode.installTap(onBus: 0,
-                             bufferSize: opusFrameSize,
-                             format: inputFormat) { [weak self] buffer, _ in
+        engine.inputNode.installTap(onBus: 0,
+                                    bufferSize: 4096,
+                                    format: nil) { [weak self] buffer, _ in
             guard let self else { return }
+            // Allocate enough output frames for the sample-rate ratio.
+            let ratio = 48000.0 / hwFormat.sampleRate
+            let outCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 1)
+            guard let converted = AVAudioPCMBuffer(pcmFormat: self.opusFormat,
+                                                   frameCapacity: outCapacity) else { return }
+            var convError: NSError?
+            var inputConsumed = false
+            converter.convert(to: converted, error: &convError) { _, outStatus in
+                if inputConsumed { outStatus.pointee = .noDataNow; return nil }
+                inputConsumed = true
+                outStatus.pointee = .haveData
+                return buffer
+            }
+            guard convError == nil, converted.frameLength > 0,
+                  let channelData = converted.floatChannelData else { return }
+            let count = Int(converted.frameLength)
+            let samples = Array(UnsafeBufferPointer(start: channelData[0], count: count))
             Task { @MainActor [weak self] in
-                guard let self, !self.isMuted, self.isConnected else { return }
-                self.encodeAndSend(buffer)
+                self?.processSamples(samples)
             }
         }
 
+        pcmAccumulator = []
         audioEngine = engine
         playerNode  = player
-
-        // Apply user-selected devices (must be before engine.start)
-        applyAudioDevices(to: engine)
+        // Device selection is applied in startAudioEngine() after engine.prepare(),
+        // so the AUHAL has a valid (non-zero) device ID before we try to switch.
     }
 
     func startAudioEngine() {
         guard let engine = audioEngine, !engine.isRunning else { return }
         do {
+            // prepare() initialises the AUHAL and assigns it valid default device IDs.
+            // applyAudioDevices() MUST come after prepare() so the AUHAL's own
+            // device ID is non-zero when we call kAudioOutputUnitProperty_CurrentDevice.
+            // Calling it earlier (when the device ID is still 0) corrupts the HAL's
+            // internal format negotiation and causes -10875 on engine.start().
+            engine.prepare()
+            applyAudioDevices(to: engine)
             try engine.start()
+            audioStartAttempts = 0
+            playerNode?.play()
             print("[Audio] Engine started")
         } catch {
-            print("[Audio] Engine start error: \(error)")
+            audioStartAttempts += 1
+            guard audioStartAttempts <= 5 else {
+                print("[Audio] Engine start giving up after \(audioStartAttempts) attempts: \(error)")
+                return
+            }
+            // Output hardware format may not be ready yet — tear down and rebuild.
+            let delay = Double(audioStartAttempts) * 0.5
+            print("[Audio] Engine start failed (attempt \(audioStartAttempts)), rebuilding in \(delay)s: \(error)")
+            stopAudioEngine()
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.setupAudioEngine()
+                self?.startAudioEngine()
+            }
         }
     }
 
@@ -837,10 +987,11 @@ class RealMumbleClient: ObservableObject {
         audioEngine    = nil
         playerNode     = nil
         opusEncoder    = nil
-        opusDecoder    = nil
+        opusDecoders   = [:]
         opusConverter  = nil
-        if let ptr = opusEncoderPtr { RealMumbleClient.opus_encoder_destroy_raw(ptr) }
-        opusEncoderPtr = nil
+        audioStartAttempts = 0
+        pcmAccumulator = []
+        silenceHoldCount = 0
         print("[Audio] Engine stopped")
     }
 
@@ -848,28 +999,6 @@ class RealMumbleClient: ObservableObject {
         playerNode?.volume = max(0, min(1, volume))
     }
 
-    // opus_encoder_ctl / opus_encoder_create / opus_encoder_destroy are C
-    // variadic or otherwise need re-declaration for Swift access.
-    @_silgen_name("opus_encoder_create")
-    private static func opus_encoder_create_raw(
-        _ sampleRate: Int32, _ channels: Int32,
-        _ application: Int32, _ error: UnsafeMutablePointer<Int32>
-    ) -> OpaquePointer
-
-    @_silgen_name("opus_encoder_destroy")
-    private static func opus_encoder_destroy_raw(_ enc: OpaquePointer)
-
-    @_silgen_name("opus_encoder_ctl")
-    private static func opus_encoder_ctl_int(
-        _ enc: OpaquePointer, _ req: Int32, _ val: Int32
-    ) -> Int32
-
-    private func applyEncoderSettings() {
-        guard let ptr = opusEncoderPtr else { return }
-        // OPUS_SET_BITRATE_REQUEST = 4002
-        let r = Self.opus_encoder_ctl_int(ptr, 4002, Int32(opusBitrate))
-        print("[Audio] Set bitrate \(opusBitrate / 1000) kbps → \(r == 0 ? "ok" : "err \(r)")")
-    }
     private func applyAudioDevices(to engine: AVAudioEngine) {
         if inputDeviceUID != "Default", !inputDeviceUID.isEmpty,
            let dev = listAudioDevices(input: true).first(where: { $0.uid == inputDeviceUID }),
@@ -891,35 +1020,72 @@ class RealMumbleClient: ObservableObject {
         }
     }
 
-    /// Convert PCM to 48 kHz mono float32, Opus-encode and send over TCP.
-    private func encodeAndSend(_ buffer: AVAudioPCMBuffer) {
-        guard let converter = opusConverter,
-              let converted = AVAudioPCMBuffer(pcmFormat: opusFormat,
-                                              frameCapacity: opusFrameSize * 4) else { return }
+    /// Reflect the local user's speaking state into the users array so the UI ring updates.
+    private func setLocalUserSpeaking(_ speaking: Bool) {
+        guard sessionId != 0,
+              let i = users.firstIndex(where: { $0.userId == Int32(sessionId) }) else { return }
+        users[i].isSpeaking = speaking
+    }
 
-        var error: NSError?
-        var consumed = false
-        converter.convert(to: converted, error: &error) { _, outStatus in
-            if consumed { outStatus.pointee = .noDataNow; return nil }
-            consumed = true
-            outStatus.pointee = .haveData
-            return buffer
+    /// Accumulate samples and encode one Opus frame (exactly opusFrameSize) at a time.
+    private func processSamples(_ samples: [Float]) {
+        guard !isMuted, isConnected else {
+            audioInputLevel = 0
+            if isSpeaking {
+                isSpeaking = false
+                setLocalUserSpeaking(false)
+            }
+            return
         }
-        guard error == nil, converted.frameLength > 0 else { return }
+        pcmAccumulator.append(contentsOf: samples)
+        let frameSize = Int(opusFrameSize)
+        while pcmAccumulator.count >= frameSize {
+            let frame = Array(pcmAccumulator.prefix(frameSize))
+            pcmAccumulator.removeFirst(frameSize)
+            encodeFrame(frame)
+        }
+    }
 
-        // RMS level for speaking indicator
-        if let ptr = converted.floatChannelData {
-            let n = Int(converted.frameLength)
-            let rms = (0..<n).reduce(0.0) { $0 + Double(ptr[0][$1]) * Double(ptr[0][$1]) }
-            let level = Float(sqrt(rms / Double(max(n, 1))))
-            audioInputLevel = min(1.0, level * 8.0)
-            isSpeaking      = level > 0.008
+    /// Opus-encode exactly opusFrameSize samples and send over TCP.
+    private func encodeFrame(_ samples: [Float]) {
+        // RMS-based voice activity detection with hold-off to avoid clipping
+        // the ends of words.  Speech is active while level > threshold OR while
+        // we are within silenceHoldFrames frames of the last active frame.
+        let rms = samples.reduce(0.0) { $0 + Double($1) * Double($1) }
+        let level = Float(sqrt(rms / Double(samples.count)))
+        audioInputLevel = min(1.0, level * 8.0)
+
+        if level > 0.008 {
+            silenceHoldCount = silenceHoldFrames
+        } else if silenceHoldCount > 0 {
+            silenceHoldCount -= 1
+        }
+        let nowSpeaking = silenceHoldCount > 0
+
+        if nowSpeaking != isSpeaking {
+            isSpeaking = nowSpeaking
+            setLocalUserSpeaking(nowSpeaking)
+            print("[Audio] Local speaking=\(nowSpeaking) level=\(String(format: "%.4f", level))")
+            if !nowSpeaking {
+                // Notify the server (and remote decoders) that this utterance ended.
+                sendTerminator()
+                return
+            }
         }
 
-        guard let encoder = opusEncoder else { return }
+        // Skip encoding and sending silence
+        guard isSpeaking, let encoder = opusEncoder else { return }
+
+        guard let pcmBuffer = AVAudioPCMBuffer(pcmFormat: opusFormat,
+                                              frameCapacity: AVAudioFrameCount(samples.count)) else { return }
+        pcmBuffer.frameLength = AVAudioFrameCount(samples.count)
+        samples.withUnsafeBufferPointer { buf in
+            pcmBuffer.floatChannelData?[0].initialize(from: buf.baseAddress!, count: samples.count)
+        }
+
         var encodedBytes = [UInt8](repeating: 0, count: 1276)
         do {
-            let encodedLen = try encoder.encode(converted, to: &encodedBytes)
+            let encodedLen = try encoder.encode(pcmBuffer, to: &encodedBytes)
             guard encodedLen > 0 else { return }
             sendAudioFrame(Data(encodedBytes.prefix(encodedLen)))
         } catch {
@@ -928,27 +1094,57 @@ class RealMumbleClient: ObservableObject {
     }
 
     /// Wrap Opus bytes in a Mumble UDPTunnel (type 1) frame and send over TCP.
+    /// Uses protobuf v2 format when the server is Mumble ≥ 1.5, legacy otherwise.
     private func sendAudioFrame(_ opusData: Data) {
-        // Audio header byte: (4 << 5) | 0 = 0x80  (Opus codec, target = normal)
-        let headerByte: UInt8 = 0x80
         let seq = audioSequence
         audioSequence &+= 1
 
         var packet = Data()
-        packet.append(headerByte)
-        packet.mumbleVarInt(seq)
-        // length field: high bit 13 marks end-of-segment (keep 0 for continuous)
-        packet.mumbleVarInt(UInt64(opusData.count))
-        packet.append(opusData)
+        if serverUseProtobufAudio {
+            // Protobuf v2: 1-byte header + MumbleUDP.Audio protobuf payload
+            // header: (0 << 5) | 0 = type=Protobuf (0), target=normal (0)
+            packet.append(UInt8(0x00))
+            var proto = Data()
+            proto.pbUInt32(field: 1, value: 0)        // target = normal speech
+            proto.pbUInt64(field: 4, value: seq)      // frame_number
+            proto.pbBytes(field: 5, value: opusData)  // opus_data
+            packet.append(proto)
+        } else {
+            // Legacy: (4 << 5) | 0 = type=Opus (4), target=normal (0)
+            packet.append(UInt8(0x80))
+            packet.mumbleVarInt(seq)
+            packet.mumbleVarInt(UInt64(opusData.count))
+            packet.append(opusData)
+        }
 
         sendFrame(type: 1, payload: packet)
 
-        // Update speaking indicator
         isSpeaking = true
         audioInputLevel = 1.0
     }
 
-    // MARK: - Compat stubs
+    /// Send an end-of-speech (terminator) packet to the server.
+    /// This lets remote Mumble clients reset their decoder state cleanly and
+    /// hides the speaking indicator immediately rather than timing out.
+    private func sendTerminator() {
+        let seq = audioSequence
+        audioSequence &+= 1
+        var packet = Data()
+        if serverUseProtobufAudio {
+            packet.append(UInt8(0x00))
+            var proto = Data()
+            proto.pbUInt32(field: 1, value: 0)     // target = normal speech
+            proto.pbUInt64(field: 4, value: seq)   // frame_number
+            proto.pbBool(field: 8, value: true)    // is_terminator
+            packet.append(proto)
+        } else {
+            packet.append(UInt8(0x80))
+            packet.mumbleVarInt(seq)
+            // Length varint with bit 13 set = end-of-stream; no Opus data follows.
+            packet.mumbleVarInt(UInt64(1 << 13))
+        }
+        sendFrame(type: 1, payload: packet)
+    }
 
     /// Channels arrive automatically via ChannelState messages after ServerSync.
     func requestChannelList() { }
