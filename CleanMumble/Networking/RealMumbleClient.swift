@@ -477,6 +477,15 @@ class RealMumbleClient: ObservableObject {
         startPingTimer()
         setupAudioEngine()
         startAudioEngine()
+
+        // Show welcome message in chat if the server provided one.
+        if !welcome.isEmpty {
+            let text = welcome.strippingHTML
+            if !text.isEmpty {
+                chatMessages.append(ChatMessage(id: UUID(), content: text, sender: "Server",
+                                                timestamp: Date(), type: .system))
+            }
+        }
     }
 
     private func onChannelRemove(_ payload: Data) {
@@ -600,10 +609,13 @@ class RealMumbleClient: ObservableObject {
             }
         }
         guard !text.isEmpty else { return }
+        // Mumble sends message bodies as HTML; strip tags for plain-text display.
+        let display = text.strippingHTML
+        guard !display.isEmpty else { return }
         let sender = actor
             .flatMap { id in users.first { $0.userId == Int32(id) }?.name }
             ?? "Server"
-        chatMessages.append(ChatMessage(id: UUID(), content: text, sender: sender,
+        chatMessages.append(ChatMessage(id: UUID(), content: display, sender: sender,
                                         timestamp: Date(), type: .text))
     }
 
@@ -784,12 +796,16 @@ class RealMumbleClient: ObservableObject {
 
     func sendTextMessage(_ message: String, to channelId: UInt32? = nil) {
         let target = channelId ?? UInt32(currentChannel?.channelId ?? 0)
+        // Mumble protocol requires HTML in the message field.
+        // Wrap in <p> and escape special HTML characters so the server and
+        // other clients (which render HTML) receive a valid message.
+        let html = "<p>\(message.escapingHTML)</p>"
         var p = Data()
         p.pbUInt32(field: 3, value: target)   // channel_id
-        p.pbString(field: 5, value: message)  // message text
+        p.pbString(field: 5, value: html)     // message text (HTML)
         sendFrame(type: 11, payload: p)
 
-        // Optimistic local echo.
+        // Optimistic local echo — show the raw message text, not the HTML.
         let me = users.first { $0.userId == Int32(sessionId) }?.name ?? username
         chatMessages.append(ChatMessage(id: UUID(), content: message, sender: me,
                                         timestamp: Date(), type: .text))
