@@ -57,6 +57,33 @@ extension String {
         let hostRegex = #"^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$"#
         return self.range(of: hostRegex, options: .regularExpression) != nil
     }
+
+    /// Strip HTML tags and decode common HTML entities for display.
+    var strippingHTML: String {
+        // Use NSAttributedString to fully parse HTML (handles entities, nested tags, etc.)
+        guard !self.isEmpty,
+              let data = self.data(using: .utf8),
+              let attributed = try? NSAttributedString(
+                  data: data,
+                  options: [.documentType: NSAttributedString.DocumentType.html,
+                            .characterEncoding: String.Encoding.utf8.rawValue],
+                  documentAttributes: nil)
+        else {
+            // Fallback: plain regex tag strip
+            return self.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+                       .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return attributed.string.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Escape HTML special characters so the string is safe inside an HTML element.
+    var escapingHTML: String {
+        self
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+    }
     
     func isValidPort() -> Bool {
         guard let port = Int(self) else { return false }
