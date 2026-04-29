@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		A6279F882E8450820036F35B /* Copus in Frameworks */ = {isa = PBXBuildFile; productRef = A6279F862E8450820036F35B /* Copus */; };
 		A6279F892E8450820036F35B /* Opus in Frameworks */ = {isa = PBXBuildFile; productRef = A6279F872E8450820036F35B /* Opus */; };
+		CC1E000100000000000A0003 /* OpusControl in Frameworks */ = {isa = PBXBuildFile; productRef = CC1E000100000000000A0002 /* OpusControl */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -59,6 +60,7 @@
 			files = (
 				A6279F882E8450820036F35B /* Copus in Frameworks */,
 				A6279F892E8450820036F35B /* Opus in Frameworks */,
+				CC1E000100000000000A0003 /* OpusControl in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -121,6 +123,7 @@
 			packageProductDependencies = (
 				A6279F862E8450820036F35B /* Copus */,
 				A6279F872E8450820036F35B /* Opus */,
+				CC1E000100000000000A0002 /* OpusControl */,
 			);
 			productName = CleanMumble;
 			productReference = A6279F532E8450810036F35B /* CleanMumble.app */;
@@ -206,6 +209,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				A6279F852E8450820036F35B /* XCRemoteSwiftPackageReference "swift-opus" */,
+				CC1E000100000000000A0001 /* XCLocalSwiftPackageReference "Packages/OpusControl" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = A6279F542E8450810036F35B /* Products */;
@@ -634,6 +638,13 @@
 		};
 /* End XCConfigurationList section */
 
+/* Begin XCLocalSwiftPackageReference section */
+		CC1E000100000000000A0001 /* XCLocalSwiftPackageReference "Packages/OpusControl" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/OpusControl;
+		};
+/* End XCLocalSwiftPackageReference section */
+
 /* Begin XCRemoteSwiftPackageReference section */
 		A6279F852E8450820036F35B /* XCRemoteSwiftPackageReference "swift-opus" */ = {
 			isa = XCRemoteSwiftPackageReference;
@@ -655,6 +666,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = A6279F852E8450820036F35B /* XCRemoteSwiftPackageReference "swift-opus" */;
 			productName = Opus;
+		};
+		CC1E000100000000000A0002 /* OpusControl */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = CC1E000100000000000A0001 /* XCLocalSwiftPackageReference "Packages/OpusControl" */;
+			productName = OpusControl;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
