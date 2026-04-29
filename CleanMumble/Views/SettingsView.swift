@@ -38,18 +38,30 @@ struct SettingsView: View {
                         ForEach(inputDevices) { d in Text(d.name).tag(d.uid) }
                     }
                     LabeledContent("Mic Level") {
-                        MicLevelMeterView(level: audioMonitor.micLevel)
-                            .frame(width: 200, height: 10)
+                        if viewModel.isConnected {
+                            Text("Available when disconnected")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else {
+                            MicLevelMeterView(level: audioMonitor.micLevel)
+                                .frame(width: 200, height: 10)
+                        }
                     }
                     Picker("Output Device", selection: $audioSettings.outputDevice) {
                         Text("System Default").tag("Default")
                         ForEach(outputDevices) { d in Text(d.name).tag(d.uid) }
                     }
                     LabeledContent("Test Output") {
-                        Button(audioMonitor.isPlayingTest ? "Playing…" : "Play Test Tone") {
-                            audioMonitor.playTestTone()
+                        if viewModel.isConnected {
+                            Text("Available when disconnected")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else {
+                            Button(audioMonitor.isPlayingTest ? "Playing…" : "Play Test Tone") {
+                                audioMonitor.playTestTone()
+                            }
+                            .disabled(audioMonitor.isPlayingTest)
                         }
-                        .disabled(audioMonitor.isPlayingTest)
                     }
                     LabeledContent("Input Volume") {
                         HStack(spacing: 8) {
@@ -68,6 +80,31 @@ struct SettingsView: View {
                     Toggle("Echo Cancellation", isOn: $audioSettings.enableEchoCancellation)
                     Toggle("Noise Suppression", isOn: $audioSettings.enableNoiseSuppression)
                     Toggle("Automatic Gain Control", isOn: $audioSettings.enableAutomaticGainControl)
+                    LabeledContent("Voice Activation") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 8) {
+                                Slider(value: $audioSettings.voiceActivityThreshold, in: 0...1)
+                                    .frame(width: 160)
+                                Text("\(Int(audioSettings.voiceActivityThreshold * 100))")
+                                    .foregroundColor(.secondary).monospacedDigit().frame(width: 38, alignment: .trailing)
+                            }
+                            // Visualise current mic level vs. activation threshold so
+                            // the user can dial it in just like Mumble's classic UI.
+                            // Only meaningful when disconnected (the monitor engine
+                            // can't run at the same time as the connected client).
+                            ZStack(alignment: .leading) {
+                                if !viewModel.isConnected {
+                                    MicLevelMeterView(level: audioMonitor.micLevel)
+                                        .frame(width: 198, height: 6)
+                                }
+                                Rectangle()
+                                    .fill(Color.primary)
+                                    .frame(width: 1.5, height: 12)
+                                    .offset(x: CGFloat(audioSettings.voiceActivityThreshold) * 198)
+                            }
+                            .frame(width: 198, height: 12)
+                        }
+                    }
                     LabeledContent("Outgoing Quality") {
                         Picker("", selection: $audioSettings.quality) {
                             ForEach(AudioQuality.allCases) { preset in
@@ -105,10 +142,27 @@ struct SettingsView: View {
             audioSettings  = viewModel.userPreferences.audioSettings
             inputDevices   = listAudioDevices(input: true)
             outputDevices  = listAudioDevices(input: false)
-            audioMonitor.startMonitoring()
+            // Don't open a second mic engine while a call is in progress —
+            // it triggers HAL format renegotiation and -10877 errors on the
+            // main client engine (especially for Bluetooth devices).
+            if !viewModel.isConnected {
+                audioMonitor.startMonitoring()
+            }
         }
         .onDisappear {
             audioMonitor.stopMonitoring()
+        }
+        // React to connection state changes WHILE Settings is open: as soon
+        // as we connect, release the mic so the client's CoreAudioIO can
+        // open it without EAGAIN ('error 35'). When we disconnect, resume
+        // the monitor so the user can level-check again.
+        .onChange(of: viewModel.isConnected) { _, connected in
+            if connected {
+                audioMonitor.stopMonitoring()
+                audioMonitor.stopTestTone()
+            } else {
+                audioMonitor.startMonitoring()
+            }
         }
     }
 }
@@ -250,5 +304,13 @@ class AudioMonitor: ObservableObject {
             isPlayingTest = false
             playbackEngine = nil
         }
+    }
+
+    /// Stop any in-flight test tone immediately. Used when the app
+    /// connects to a server so the playback engine releases the device.
+    func stopTestTone() {
+        playbackEngine?.stop()
+        playbackEngine = nil
+        isPlayingTest = false
     }
 }

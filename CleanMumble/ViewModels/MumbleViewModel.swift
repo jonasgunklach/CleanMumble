@@ -246,14 +246,27 @@ class MumbleViewModel: ObservableObject {
         saveUserPreferences()
         // If connected, apply new device selection immediately
         if let client = realMumbleClient {
+            let deviceChanged = client.inputDeviceUID != settings.inputDevice
+                         || client.outputDeviceUID != settings.outputDevice
             client.inputDeviceUID  = settings.inputDevice
             client.outputDeviceUID = settings.outputDevice
             client.opusBitrate  = settings.quality.bitrate
             client.opusFrameMs  = settings.quality.frameMs
             client.opusLowDelay = settings.quality.lowDelay
+            // Map slider 0…1 → RMS 0.001 (very sensitive) … 0.05 (loud only).
+            // Mumble-style voice activation: anything below the threshold is
+            // treated as silence and not transmitted.
+            client.vadThreshold = 0.001 + Float(settings.voiceActivityThreshold) * 0.049
             client.stopAudioEngine()
-            client.setupAudioEngine()
-            client.startAudioEngine()
+            // The native CoreAudio path handles device hot-swap via AU
+            // property listeners; no settle delay needed. The legacy
+            // AVAudioEngine path used to need ~0.8s for Bluetooth devices.
+            let rebuildDelay: Double = deviceChanged ? 0.2 : 0.0
+            DispatchQueue.main.asyncAfter(deadline: .now() + rebuildDelay) { [weak client] in
+                guard let client else { return }
+                client.setupAudioEngine()
+                client.startAudioEngine()
+            }
         }
     }
     

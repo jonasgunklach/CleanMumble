@@ -26,6 +26,7 @@ import AVFoundation
 import CoreAudio
 import AudioToolbox
 import Opus
+import OpusControl
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Protobuf decoder
@@ -181,6 +182,13 @@ class RealMumbleClient: ObservableObject {
     /// `true` once the server has announced version ≥ 1.5; drives audio format choice.
     private var serverUseProtobufAudio: Bool = false
 
+    /// New native CoreAudio (AUHAL) I/O. When non-nil, replaces the
+    /// AVAudioEngine-based capture/playback below. Selected via the
+    /// `useCoreAudioIO` flag (default ON). Set the env var
+    /// `CLEANMUMBLE_LEGACY_AUDIO=1` to opt back into the legacy path.
+    private var coreAudioIO: CoreAudioIO?
+    private let useCoreAudioIO: Bool = (ProcessInfo.processInfo.environment["CLEANMUMBLE_LEGACY_AUDIO"] != "1")
+
     private var audioEngine: AVAudioEngine?
     private var playerNode: AVAudioPlayerNode?
     private var opusEncoder: Opus.Encoder?
@@ -188,6 +196,16 @@ class RealMumbleClient: ObservableObject {
     /// Each remote user must have their own decoder context so the LPC
     /// predictor state for one speaker doesn't corrupt another speaker's audio.
     private var opusDecoders: [Int32: Opus.Decoder] = [:]
+    /// Per-speaker scheduling state for the playback jitter buffer.
+    /// `nextSampleTime` is the sample-time at which the *next* incoming buffer
+    /// should be scheduled on the player. Maintaining this per speaker means
+    /// late packets from speaker A don't shift speaker B's playback.
+    private struct PlayQueue {
+        var nextSampleTime: AVAudioFramePosition? = nil
+    }
+    private var playQueues: [Int32: PlayQueue] = [:]
+    /// Initial playback lead used to absorb network jitter (~60 ms = 3 frames@20ms).
+    private let jitterLeadSeconds: Double = 0.06
     private var opusConverter: AVAudioConverter?
     private var audioStartAttempts: Int = 0
     private var udpAudioPacketCount: Int = 0
@@ -198,6 +216,8 @@ class RealMumbleClient: ObservableObject {
     var opusBitrate:  Int  = 40000   // bits/s
     var opusFrameMs:  Int  = 20      // 10 / 20 / 40 / 60 ms
     var opusLowDelay: Bool = false   // restricted low-delay application mode
+    /// VAD trigger threshold as raw RMS (typ. 0.003 … 0.05). Settable from UI.
+    var vadThreshold: Float = 0.008
     /// Frame size in samples derived from opusFrameMs (48 kHz).
     private var opusFrameSize: AVAudioFrameCount { AVAudioFrameCount(opusFrameMs * 48) }
     /// Monotonically increasing sequence number for outgoing audio packets.
@@ -206,10 +226,17 @@ class RealMumbleClient: ObservableObject {
     private var speakingTimers: [Int32: Timer] = [:]
     /// Accumulates 48 kHz mono float32 samples until we have a full Opus frame.
     private var pcmAccumulator: [Float] = []
+    /// Diagnostic counter for once-per-second input pipeline tick logging.
+    private var diagSampleCounter: Int = 0
+    /// Logs the first few render-callback chunks verbatim so we can confirm
+    /// the AUHAL is actually delivering buffers (not just "Started").
+    private var diagFirstChunks: Int = 8
     /// Counts consecutive silent frames; resets on speech. Used for VAD hold-off.
     private var silenceHoldCount: Int = 0
-    /// Number of silent frames to hold before declaring end-of-speech (~300 ms at 20 ms/frame).
-    private let silenceHoldFrames = 15
+    /// Number of silent frames to hold before declaring end-of-speech (~300 ms).
+    /// Computed from the current Opus frame size so changing quality preset
+    /// keeps the hold-off at a constant wall-clock duration.
+    private var silenceHoldFrames: Int { max(1, 300 / max(1, opusFrameMs)) }
     /// 48 kHz mono float32 format used for both capture and playback.
     private let opusFormat = AVAudioFormat(opusPCMFormat: .float32, sampleRate: 48000, channels: 1)!
 
@@ -475,8 +502,15 @@ class RealMumbleClient: ObservableObject {
         print("[Mumble] ServerSync – session \(session)" +
               (welcome.isEmpty ? "" : ", welcome: \(welcome.prefix(80))"))
         startPingTimer()
-        setupAudioEngine()
-        startAudioEngine()
+        ensureMicrophoneAccess { [weak self] granted in
+            guard let self else { return }
+            if granted {
+                self.setupAudioEngine()
+                self.startAudioEngine()
+            } else {
+                print("[Audio] Microphone access denied. Open System Settings → Privacy & Security → Microphone and enable CleanMumble.")
+            }
+        }
 
         // Show welcome message in chat if the server provided one.
         if !welcome.isEmpty {
@@ -662,7 +696,10 @@ class RealMumbleClient: ObservableObject {
         let isTerminator = (rawLen & (1 << 13)) != 0
         let opusLen = Int(rawLen & ~(1 << 13))
         if isTerminator {
-            opusDecoders[Int32(senderSession)] = nil  // discard so next utterance gets a fresh decoder
+            // Reset only the playback timing, NOT the Opus decoder. Discarding
+            // the decoder corrupts LPC predictor warm-up and produces an audible
+            // click on the first frame of the next utterance.
+            playQueues[Int32(senderSession)] = nil
             return
         }
         guard opusLen > 0, pos + opusLen <= payload.count else { return }
@@ -687,8 +724,10 @@ class RealMumbleClient: ObservableObject {
             }
         }
         if isTerminator {
-            // Discard this speaker's decoder so the next utterance starts fresh.
-            opusDecoders[Int32(senderSession)] = nil
+            // Reset only the playback timing, NOT the Opus decoder. Discarding
+            // the decoder corrupts LPC predictor warm-up and produces an audible
+            // click on the first frame of the next utterance.
+            playQueues[Int32(senderSession)] = nil
             return
         }
         guard let opusBytes = opusData, !opusBytes.isEmpty else { return }
@@ -721,6 +760,29 @@ class RealMumbleClient: ObservableObject {
             if udpAudioPacketCount < 5 { print("[Audio] Skipped decode: deafened") }
             return
         }
+        // CoreAudio path: decode → push mono Float32 PCM into the output ring buffer.
+        if useCoreAudioIO {
+            guard let io = coreAudioIO, io.isRunning else {
+                if udpAudioPacketCount < 5 { print("[Audio] Skipped decode: coreAudioIO not running") }
+                return
+            }
+            let decoder: Opus.Decoder
+            if let existing = opusDecoders[sender] {
+                decoder = existing
+            } else {
+                guard let fresh = try? Opus.Decoder(format: opusFormat) else { return }
+                opusDecoders[sender] = fresh
+                decoder = fresh
+            }
+            do {
+                let pcm = try decoder.decode(opusBytes)
+                guard let ch = pcm.floatChannelData?[0], pcm.frameLength > 0 else { return }
+                io.enqueuePlayback(ch, count: Int(pcm.frameLength))
+            } catch {
+                print("[Audio] Decode error: \(error)")
+            }
+            return
+        }
         guard let player = playerNode,
               let engine = audioEngine, engine.isRunning else {
             if udpAudioPacketCount < 5 {
@@ -739,10 +801,44 @@ class RealMumbleClient: ObservableObject {
         }
         do {
             let pcm = try decoder.decode(opusBytes)
-            player.scheduleBuffer(pcm, completionHandler: nil)
+            scheduleWithJitter(pcm, on: player, sender: sender)
         } catch {
             print("[Audio] Decode error: \(error)")
         }
+    }
+
+    /// Schedule a decoded PCM buffer on the player using a per-speaker jitter
+    /// buffer. The first packet of an utterance is scheduled `jitterLeadSeconds`
+    /// in the future; subsequent packets are stitched directly onto the end of
+    /// the previous one. This eliminates the underrun-clicks that happen when
+    /// `scheduleBuffer(_:)` is called with no `at:` time and a packet arrives
+    /// even slightly late.
+    private func scheduleWithJitter(_ pcm: AVAudioPCMBuffer,
+                                    on player: AVAudioPlayerNode,
+                                    sender: Int32) {
+        let sr = opusFormat.sampleRate
+        var queue = playQueues[sender] ?? PlayQueue()
+
+        let scheduledSample: AVAudioFramePosition
+        if let next = queue.nextSampleTime {
+            // Continuation of an active utterance — append directly.
+            scheduledSample = next
+        } else {
+            // First packet (or first after terminator). Anchor to *now* + lead.
+            let nowSample: AVAudioFramePosition
+            if let lastRender = player.lastRenderTime,
+               let playerTime = player.playerTime(forNodeTime: lastRender) {
+                nowSample = playerTime.sampleTime
+            } else {
+                nowSample = 0
+            }
+            scheduledSample = nowSample + AVAudioFramePosition(sr * jitterLeadSeconds)
+        }
+
+        let when = AVAudioTime(sampleTime: scheduledSample, atRate: sr)
+        player.scheduleBuffer(pcm, at: when, options: [], completionHandler: nil)
+        queue.nextSampleTime = scheduledSample + AVAudioFramePosition(pcm.frameLength)
+        playQueues[sender] = queue
     }
 
     private func onServerConfig(_ payload: Data) {
@@ -828,7 +924,11 @@ class RealMumbleClient: ObservableObject {
         if isDeafened { isMuted = true }
         sendUserState(selfMute: isMuted, selfDeaf: isDeafened)
         // Player volume: mute output when deafened
-        playerNode?.volume = isDeafened ? 0.0 : 1.0
+        if useCoreAudioIO {
+            coreAudioIO?.output.gain = isDeafened ? 0.0 : 1.0
+        } else {
+            playerNode?.volume = isDeafened ? 0.0 : 1.0
+        }
     }
 
     private func sendUserState(selfMute: Bool, selfDeaf: Bool) {
@@ -900,32 +1000,115 @@ class RealMumbleClient: ObservableObject {
     // MARK: - Audio engine (Opus via TCP UDPTunnel)
     // ─────────────────────────────────────────────────────────────────────────
 
+    /// Verify (and request, if needed) microphone permission before touching
+    /// AVAudioEngine. Without this, `engine.inputNode.outputFormat(...)` and
+    /// `engine.start()` fail with -10877 / -10867 forever, with no UI prompt
+    /// because AVAudioEngine doesn't trigger the TCC dialog by itself.
+    private func ensureMicrophoneAccess(_ completion: @escaping (Bool) -> Void) {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            completion(true)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                DispatchQueue.main.async { completion(granted) }
+            }
+        case .denied, .restricted:
+            completion(false)
+        @unknown default:
+            completion(false)
+        }
+    }
+
     func setupAudioEngine() {
+        if useCoreAudioIO {
+            setupCoreAudioIO()
+            return
+        }
         guard audioEngine == nil else { return }
         let application: Opus.Application = opusLowDelay ? .restrictedLowDelay : .voip
         do {
-            opusEncoder = try Opus.Encoder(format: opusFormat, application: application)
-            // Decoders are created on-demand per speaker in decodeAndPlay().
-            print("[Audio] Opus encoder ready (frame=\(opusFrameMs)ms / \(opusFrameSize) samples)")
+            let encoder = try Opus.Encoder(format: opusFormat, application: application)
+            // Apply bitrate / quality knobs via the OpusControl shim. The
+            // upstream `swift-opus` only exposes `opus_encoder_create`, so all
+            // of these would otherwise be Opus's defaults (auto bitrate,
+            // complexity 9, no FEC) regardless of the user's quality preset.
+            do {
+                try encoder.setSignal(.voice)
+                try encoder.setBitrate(Int32(opusBitrate))
+                try encoder.setComplexity(opusLowDelay ? 5 : 8)
+                try encoder.setVBR(true)
+                try encoder.setInbandFEC(true)
+                try encoder.setPacketLossPercentage(10)
+            } catch {
+                print("[Audio] Opus control warning: \(error)")
+            }
+            opusEncoder = encoder
+            print("[Audio] Opus encoder ready (frame=\(opusFrameMs)ms / \(opusFrameSize) samples, bitrate=\(opusBitrate))")
         } catch {
             print("[Audio] Failed to create Opus encoder: \(error)"); return
         }
         let engine = AVAudioEngine()
         let player = AVAudioPlayerNode()
         engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: opusFormat)
+
+        // CRITICAL ORDERING:
+        //   1. Connect player → mainMixerNode first.
+        //      This forces AVAudioEngine to lazily create and fully initialise
+        //      both the mainMixerNode AND the output AUHAL (outputNode) with the
+        //      current system-default device. Without this, engine.outputNode.audioUnit
+        //      is not properly configured and AudioUnitSetProperty for device switching
+        //      corrupts the AUHAL's internal device ID to 0, causing outputFormat
+        //      to return 0ch/0Hz.
+        //   2. THEN call applyAudioDevices to switch to the user-selected devices.
+        //      At this point both AUHALs are initialised and can safely change device.
+        //   3. Read HW formats — now reflects the switched devices.
+        //   4. Build converter + install tap.
+        //
+        // We deliberately do NOT call engine.prepare() here — engine.start()
+        // performs preparation implicitly, and an explicit prepare() before
+        // device switching has been observed to emit -10877 noise and trip
+        // -10867 (kAudioUnitErr_CannotDoInCurrentContext) at start().
+        let mixer = engine.mainMixerNode        // initialises output AUHAL
+        engine.connect(player, to: mixer, format: opusFormat)
 
         // NOTE: setVoiceProcessingEnabled is intentionally NOT called here.
         // It creates an AUVPAggregate device incompatible with Bluetooth audio
         // (AirPods etc.) — produces mic channel count 0 and cascading -10877 errors.
 
+        applyAudioDevices(to: engine)
+
         // Use the hardware's native format for the tap — passing a mismatched
         // format crashes with "Failed to create tap due to format mismatch".
         // We convert to 48 kHz mono float32 ourselves inside the tap block.
-        let hwFormat = engine.inputNode.outputFormat(forBus: 0)
-        print("[Audio] Input HW format: \(hwFormat) | Output HW format: \(engine.outputNode.outputFormat(forBus: 0))")
-        guard hwFormat.sampleRate > 0, hwFormat.channelCount > 0 else {
-            print("[Audio] Input HW format not ready yet — will retry"); return
+        let hwFormat   = engine.inputNode.outputFormat(forBus: 0)
+        let outHwFmt   = engine.outputNode.outputFormat(forBus: 0)
+        print("[Audio] Input HW format: \(hwFormat) | Output HW format: \(outHwFmt)")
+
+        // Both formats must be valid. The output format goes 0ch/0Hz when a
+        // Bluetooth device (e.g. AirPods) hasn't finished connecting to CoreAudio
+        // yet — which is the common case right after a Settings change.
+        let inputReady  = hwFormat.sampleRate > 0 && hwFormat.channelCount > 0
+        let outputReady = outHwFmt.sampleRate > 0 && outHwFmt.channelCount > 0
+        guard inputReady, outputReady else {
+            // The HAL hasn't published its format yet (common right after a device
+            // switch). Tear down the half-built engine and retry shortly so we
+            // don't leave audioEngine == nil with no scheduled recovery.
+            let missing = !inputReady ? "Input" : "Output"
+            print("[Audio] \(missing) HW format not ready yet — retrying in 0.5s")
+            engine.stop()
+            opusEncoder = nil
+            audioStartAttempts += 1
+            guard audioStartAttempts <= 5 else {
+                print("[Audio] Giving up on HW format after \(audioStartAttempts) attempts")
+                audioStartAttempts = 0
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self, self.isConnected else { return }
+                self.setupAudioEngine()
+                self.startAudioEngine()
+            }
+            return
         }
         guard let converter = AVAudioConverter(from: hwFormat, to: opusFormat) else {
             print("[Audio] Cannot create converter \(hwFormat) → \(opusFormat)"); return
@@ -961,42 +1144,52 @@ class RealMumbleClient: ObservableObject {
         pcmAccumulator = []
         audioEngine = engine
         playerNode  = player
-        // Device selection is applied in startAudioEngine() after engine.prepare(),
-        // so the AUHAL has a valid (non-zero) device ID before we try to switch.
     }
 
     func startAudioEngine() {
+        if useCoreAudioIO {
+            // CoreAudioIO is started inside setupCoreAudioIO; nothing to do.
+            return
+        }
         guard let engine = audioEngine, !engine.isRunning else { return }
         do {
-            // prepare() initialises the AUHAL and assigns it valid default device IDs.
-            // applyAudioDevices() MUST come after prepare() so the AUHAL's own
-            // device ID is non-zero when we call kAudioOutputUnitProperty_CurrentDevice.
-            // Calling it earlier (when the device ID is still 0) corrupts the HAL's
-            // internal format negotiation and causes -10875 on engine.start().
-            engine.prepare()
-            applyAudioDevices(to: engine)
             try engine.start()
             audioStartAttempts = 0
             playerNode?.play()
             print("[Audio] Engine started")
         } catch {
             audioStartAttempts += 1
-            guard audioStartAttempts <= 5 else {
+            guard audioStartAttempts <= 3 else {
                 print("[Audio] Engine start giving up after \(audioStartAttempts) attempts: \(error)")
+                print("[Audio] Most likely causes: another app holds exclusive mic access (Zoom/Discord/Teams), the input device was unplugged, or a kernel audio driver issue. Try quitting other audio apps and reconnecting.")
+                stopAudioEngine()
+                audioStartAttempts = 0
                 return
             }
-            // Output hardware format may not be ready yet — tear down and rebuild.
-            let delay = Double(audioStartAttempts) * 0.5
-            print("[Audio] Engine start failed (attempt \(audioStartAttempts)), rebuilding in \(delay)s: \(error)")
-            stopAudioEngine()
+            let delay = pow(2.0, Double(audioStartAttempts - 1))
+            print("[Audio] Engine start failed (attempt \(audioStartAttempts)/3), retrying in \(delay)s: \(error)")
+            // For format errors (-10875), a simple stop+restart won't help because
+            // the invalid device format is baked into the engine graph. Tear down
+            // and rebuild the whole graph so applyAudioDevices re-runs after the
+            // Bluetooth device finishes connecting.
+            let isFormatError = (error as NSError).code == -10875
+            tearDownAudioEngineKeepingRetryState()
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                self?.setupAudioEngine()
-                self?.startAudioEngine()
+                guard let self, self.isConnected else {
+                    self?.audioStartAttempts = 0
+                    return
+                }
+                if isFormatError {
+                    self.setupAudioEngine()
+                }
+                self.startAudioEngine()
             }
         }
     }
 
-    func stopAudioEngine() {
+    /// Internal helper: tear down the engine but preserve the retry counter
+    /// so `startAudioEngine` can actually give up after N tries.
+    private func tearDownAudioEngineKeepingRetryState() {
         audioEngine?.inputNode.removeTap(onBus: 0)
         playerNode?.stop()
         audioEngine?.stop()
@@ -1004,15 +1197,95 @@ class RealMumbleClient: ObservableObject {
         playerNode     = nil
         opusEncoder    = nil
         opusDecoders   = [:]
+        playQueues     = [:]
         opusConverter  = nil
-        audioStartAttempts = 0
         pcmAccumulator = []
         silenceHoldCount = 0
+    }
+
+    func stopAudioEngine() {
+        if useCoreAudioIO {
+            coreAudioIO?.stop()
+            coreAudioIO = nil
+            opusEncoder = nil
+            opusDecoders = [:]
+            pcmAccumulator = []
+            silenceHoldCount = 0
+            print("[Audio] CoreAudioIO stopped")
+            return
+        }
+        tearDownAudioEngineKeepingRetryState()
+        audioStartAttempts = 0
         print("[Audio] Engine stopped")
     }
 
+    // MARK: - CoreAudioIO path
+
+    /// Build the Opus encoder + start native CoreAudio capture/playback.
+    private func setupCoreAudioIO() {
+        // Reuse: if already running with the same UIDs, do nothing.
+        if let existing = coreAudioIO,
+           existing.isRunning,
+           existing.inputDeviceUID == inputDeviceUID,
+           existing.outputDeviceUID == outputDeviceUID {
+            return
+        }
+        // Tear down anything in flight.
+        coreAudioIO?.stop()
+        coreAudioIO = nil
+        // Re-arm input pipeline diagnostics for the new session.
+        diagFirstChunks = 8
+        diagSampleCounter = 0
+
+        // Opus encoder (same configuration as legacy path).
+        let application: Opus.Application = opusLowDelay ? .restrictedLowDelay : .voip
+        do {
+            let encoder = try Opus.Encoder(format: opusFormat, application: application)
+            do {
+                try encoder.setSignal(.voice)
+                try encoder.setBitrate(Int32(opusBitrate))
+                try encoder.setComplexity(opusLowDelay ? 5 : 8)
+                try encoder.setVBR(true)
+                try encoder.setInbandFEC(true)
+                try encoder.setPacketLossPercentage(10)
+            } catch {
+                print("[Audio] Opus control warning: \(error)")
+            }
+            opusEncoder = encoder
+            print("[Audio] (CoreAudioIO) Opus encoder ready (frame=\(opusFrameMs)ms / \(opusFrameSize) samples, bitrate=\(opusBitrate))")
+        } catch {
+            print("[Audio] (CoreAudioIO) Failed to create Opus encoder: \(error)"); return
+        }
+
+        let io = CoreAudioIO()
+        io.inputDeviceUID  = inputDeviceUID
+        io.outputDeviceUID = outputDeviceUID
+        io.output.gain     = isDeafened ? 0.0 : 1.0
+
+        // Realtime input callback: copy samples out and dispatch to MainActor
+        // for protobuf/Opus processing on the existing path.
+        io.input.onSamples = { [weak self] ptr, n in
+            guard n > 0 else { return }
+            let buf = UnsafeBufferPointer(start: ptr, count: n)
+            let samples = Array(buf)
+            Task { @MainActor [weak self] in
+                self?.processSamples(samples)
+            }
+        }
+
+        io.start()
+        coreAudioIO = io
+        pcmAccumulator = []
+        silenceHoldCount = 0
+    }
+
     func setOutputVolume(_ volume: Float) {
-        playerNode?.volume = max(0, min(1, volume))
+        let v = max(0, min(1, volume))
+        if useCoreAudioIO {
+            coreAudioIO?.output.gain = v
+            return
+        }
+        playerNode?.volume = v
     }
 
     private func applyAudioDevices(to engine: AVAudioEngine) {
@@ -1020,19 +1293,43 @@ class RealMumbleClient: ObservableObject {
            let dev = listAudioDevices(input: true).first(where: { $0.uid == inputDeviceUID }),
            let au = engine.inputNode.audioUnit {
             var devID = dev.id
-            AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice,
-                                 kAudioUnitScope_Global, 0,
-                                 &devID, UInt32(MemoryLayout<AudioDeviceID>.size))
-            print("[Audio] Input device → \(dev.name)")
+            let status = AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice,
+                                              kAudioUnitScope_Global, 0,
+                                              &devID, UInt32(MemoryLayout<AudioDeviceID>.size))
+            if status == noErr { print("[Audio] Input device → \(dev.name)") }
+            else { print("[Audio] Failed to switch input device → \(dev.name): OSStatus \(status)") }
         }
         if outputDeviceUID != "Default", !outputDeviceUID.isEmpty,
            let dev = listAudioDevices(input: false).first(where: { $0.uid == outputDeviceUID }),
            let au = engine.outputNode.audioUnit {
             var devID = dev.id
-            AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice,
-                                 kAudioUnitScope_Global, 0,
-                                 &devID, UInt32(MemoryLayout<AudioDeviceID>.size))
-            print("[Audio] Output device → \(dev.name)")
+            let status = AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice,
+                                              kAudioUnitScope_Global, 0,
+                                              &devID, UInt32(MemoryLayout<AudioDeviceID>.size))
+            if status == noErr { print("[Audio] Output device → \(dev.name)") }
+            else {
+                print("[Audio] Failed to switch output device → \(dev.name): OSStatus \(status)")
+                // A failed AudioUnitSetProperty corrupts the AUHAL's internal device
+                // reference, leaving outputNode.outputFormat at 0ch/0Hz and making
+                // engine.start() fail. Reset explicitly to the system-default output
+                // device so the AUHAL is in a clean state and the engine can start.
+                // Audio will route through the system default until the Bluetooth
+                // device finishes connecting and the user re-applies settings.
+                var defaultID = AudioDeviceID(0)
+                var sz   = UInt32(MemoryLayout<AudioDeviceID>.size)
+                var addr = AudioObjectPropertyAddress(
+                    mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                    mScope:    kAudioObjectPropertyScopeGlobal,
+                    mElement:  kAudioObjectPropertyElementMain)
+                if AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                              &addr, 0, nil, &sz, &defaultID) == noErr,
+                   defaultID != 0 {
+                    AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice,
+                                        kAudioUnitScope_Global, 0,
+                                        &defaultID, UInt32(MemoryLayout<AudioDeviceID>.size))
+                    print("[Audio] Output reset to system default (Bluetooth not yet ready)")
+                }
+            }
         }
     }
 
@@ -1045,6 +1342,31 @@ class RealMumbleClient: ObservableObject {
 
     /// Accumulate samples and encode one Opus frame (exactly opusFrameSize) at a time.
     private func processSamples(_ samples: [Float]) {
+        // Diagnostic: log the first few callbacks so we know the input pipeline
+        // is alive end-to-end, then drop to once-per-second.
+        if diagFirstChunks > 0 {
+            diagFirstChunks -= 1
+            var sum: Double = 0
+            for s in samples { sum += Double(s) * Double(s) }
+            let lvl = Float(sqrt(sum / Double(max(samples.count, 1))))
+            print(String(format: "[Audio][DIAG] first-chunk: %d samples, RMS=%.5f, isMuted=%@, isConnected=%@",
+                         samples.count, lvl,
+                         isMuted ? "Y" : "N",
+                         isConnected ? "Y" : "N"))
+        }
+        diagSampleCounter += samples.count
+        if diagSampleCounter >= 48_000 {
+            let n = samples.count
+            var sum: Double = 0
+            for s in samples { sum += Double(s) * Double(s) }
+            let lvl = Float(sqrt(sum / Double(max(n, 1))))
+            print(String(format: "[Audio][DIAG] tick: %d samples last chunk, RMS=%.5f, isMuted=%@, isConnected=%@, vadThr=%.4f",
+                         n, lvl,
+                         isMuted ? "Y" : "N",
+                         isConnected ? "Y" : "N",
+                         vadThreshold))
+            diagSampleCounter = 0
+        }
         guard !isMuted, isConnected else {
             audioInputLevel = 0
             if isSpeaking {
@@ -1071,7 +1393,7 @@ class RealMumbleClient: ObservableObject {
         let level = Float(sqrt(rms / Double(samples.count)))
         audioInputLevel = min(1.0, level * 8.0)
 
-        if level > 0.008 {
+        if level > vadThreshold {
             silenceHoldCount = silenceHoldFrames
         } else if silenceHoldCount > 0 {
             silenceHoldCount -= 1
@@ -1082,7 +1404,11 @@ class RealMumbleClient: ObservableObject {
             isSpeaking = nowSpeaking
             setLocalUserSpeaking(nowSpeaking)
             print("[Audio] Local speaking=\(nowSpeaking) level=\(String(format: "%.4f", level))")
-            if !nowSpeaking {
+            if nowSpeaking {
+                // Reset the audio sequence at the start of each utterance so
+                // remote clients see a clean monotonic stream per stream.
+                audioSequence = 0
+            } else {
                 // Notify the server (and remote decoders) that this utterance ended.
                 sendTerminator()
                 return
