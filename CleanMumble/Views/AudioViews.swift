@@ -53,35 +53,57 @@ struct AudioControlsView: View {
             
             // Volume controls
             VStack(spacing: 12) {
-                // Input volume
+                // Input volume + live mic level meter
                 HStack {
                     Image(systemName: "mic")
                         .foregroundColor(.secondary)
                         .frame(width: 20)
-                    
-                    Slider(value: $viewModel.inputVolume, in: 0...1)
-                        .accentColor(.blue)
-                    
+
+                    Slider(
+                        value: Binding(
+                            get: { viewModel.inputVolume },
+                            set: { viewModel.setInputVolume($0) }
+                        ),
+                        in: 0...4
+                    )
+                    .accentColor(.blue)
+
                     Text("\(Int(viewModel.inputVolume * 100))%")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                        .frame(width: 35, alignment: .trailing)
+                        .frame(width: 45, alignment: .trailing)
                 }
-                
-                // Output volume
+                LevelMeterBar(rms: viewModel.micLevelRMS,
+                              peak: viewModel.micLevelPeak,
+                              tint: .blue)
+                    .frame(height: 6)
+                    .padding(.leading, 28)
+
+                // Output volume + live playback level meter
                 HStack {
                     Image(systemName: "speaker.2")
                         .foregroundColor(.secondary)
                         .frame(width: 20)
-                    
-                    Slider(value: $viewModel.outputVolume, in: 0...1)
+
+                    Slider(
+                        value: Binding(
+                            get: { viewModel.outputVolume },
+                            set: { viewModel.setOutputVolume($0) }
+                        ),
+                        in: 0...1
+                    )
                         .accentColor(.green)
-                    
+
                     Text("\(Int(viewModel.outputVolume * 100))%")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                        .frame(width: 35, alignment: .trailing)
+                        .frame(width: 45, alignment: .trailing)
                 }
+                LevelMeterBar(rms: viewModel.outputLevelRMS,
+                              peak: viewModel.outputLevelPeak,
+                              tint: .green)
+                    .frame(height: 6)
+                    .padding(.leading, 28)
             }
             .padding(.horizontal)
             
@@ -174,5 +196,50 @@ struct AudioVisualizer: View {
     }
 }
 
+/// Horizontal VU-style level meter. Maps RMS \u2192 a green/yellow/red filled bar
+/// (log-mapped so quiet signals are visible), with a thin held-peak tick.
+/// Inputs are linear amplitude in [0, 1].
+struct LevelMeterBar: View {
+    let rms: Float
+    let peak: Float
+    let tint: Color
 
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let rmsW = CGFloat(scaled(rms)) * w
+            let peakX = CGFloat(scaled(peak)) * w
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.2))
+                Capsule()
+                    .fill(barColor)
+                    .frame(width: max(2, rmsW))
+                Rectangle()
+                    .fill(Color.primary)
+                    .frame(width: 2, height: geo.size.height)
+                    .offset(x: max(0, peakX - 1))
+                    .opacity(peak > 0.001 ? 0.85 : 0)
+            }
+            .clipShape(Capsule())
+        }
+    }
+
+    private var barColor: Color {
+        switch peak {
+        case ..<0.5:  return tint
+        case 0.5..<0.85: return .yellow
+        default: return .red
+        }
+    }
+
+    /// Map linear amplitude to a perceptually flatter [0, 1] for the bar.
+    /// Floor at -60 dBFS.
+    private func scaled(_ x: Float) -> Float {
+        guard x > 1e-5 else { return 0 }
+        let db = 20 * log10f(x)
+        let n = (db + 60) / 60      // -60 dB \u2192 0,  0 dB \u2192 1
+        return max(0, min(1, n))
+    }
+}
 

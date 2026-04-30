@@ -187,6 +187,10 @@ class RealMumbleClient: ObservableObject {
     /// `useCoreAudioIO` flag (default ON). Set the env var
     /// `CLEANMUMBLE_LEGACY_AUDIO=1` to opt back into the legacy path.
     private var coreAudioIO: CoreAudioIO?
+    /// Read-only accessor used by `MumbleViewModel` to drive the live mic /
+    /// output VU meters. Returns nil if the legacy AVAudioEngine path is
+    /// active or capture hasn't started yet.
+    var coreAudioIOForUI: CoreAudioIO? { coreAudioIO }
     private let useCoreAudioIO: Bool = (ProcessInfo.processInfo.environment["CLEANMUMBLE_LEGACY_AUDIO"] != "1")
 
     private var audioEngine: AVAudioEngine?
@@ -218,6 +222,12 @@ class RealMumbleClient: ObservableObject {
     var opusLowDelay: Bool = false   // restricted low-delay application mode
     /// VAD trigger threshold as raw RMS (typ. 0.003 … 0.05). Settable from UI.
     var vadThreshold: Float = 0.008
+    /// Linear input gain applied to the microphone before encoding. Default
+    /// 1.0 (unity). Pushed through to `CoreAudioIO.input.inputGain` whenever
+    /// the engine is running. UI exposes this via the input slider.
+    var inputGain: Float = 1.0 {
+        didSet { coreAudioIO?.input.inputGain = max(0, min(8, inputGain)) }
+    }
     /// Frame size in samples derived from opusFrameMs (48 kHz).
     private var opusFrameSize: AVAudioFrameCount { AVAudioFrameCount(opusFrameMs * 48) }
     /// Monotonically increasing sequence number for outgoing audio packets.
@@ -1261,6 +1271,7 @@ class RealMumbleClient: ObservableObject {
         io.inputDeviceUID  = inputDeviceUID
         io.outputDeviceUID = outputDeviceUID
         io.output.gain     = isDeafened ? 0.0 : 1.0
+        io.input.inputGain = max(0, min(8, inputGain))
 
         // Realtime input callback: copy samples out and dispatch to MainActor
         // for protobuf/Opus processing on the existing path.
