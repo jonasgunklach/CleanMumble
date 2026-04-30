@@ -19,6 +19,7 @@ import CoreAudio
 import AudioToolbox
 import AudioUnit
 import os.lock
+import AudioCore
 
 // MARK: - Stream formats
 
@@ -259,6 +260,18 @@ final class CoreAudioInput {
     /// changes and the input has restarted (or failed to). Use it to refresh
     /// any cached format info.
     var onRestart: (() -> Void)?
+
+    /// Linear input gain applied AFTER resampling, BEFORE delivery to
+    /// `onSamples`. Adjustable from any thread; the render callback reads it
+    /// once per frame. 1.0 = unity, 0.0 = silence, hard-clamped to [0, 8].
+    let inputGainProcessor = GainProcessor(gain: 1.0)
+    var inputGain: Float {
+        get { inputGainProcessor.gain }
+        set { inputGainProcessor.gain = newValue }
+    }
+    /// Smoothed RMS / peak level meter — observes the mic samples AFTER
+    /// gain. Read via `inputMeter.snapshot()` from a UI timer.
+    let inputMeter = LevelMeter()
 
     /// The UID requested by the user ("Default" / "" → system default).
     var deviceUID: String = "Default"
@@ -600,6 +613,8 @@ final class CoreAudioInput {
             // Deliver any frames the converter produced, even if it returned
             // a non-zero status (typical when input ran dry mid-fill).
             if outFrames > 0 {
+                inputGainProcessor.applyInPlace(dst, count: Int(outFrames))
+                inputMeter.observe(dst, count: Int(outFrames))
                 onSamples?(dst, Int(outFrames))
             } else if cerr != noErr {
                 // Periodic-but-not-spammy log: only first few failures.
@@ -608,6 +623,8 @@ final class CoreAudioInput {
                 }
             }
         } else {
+            inputGainProcessor.applyInPlace(scratch, count: Int(frames))
+            inputMeter.observe(scratch, count: Int(frames))
             onSamples?(scratch, Int(frames))
         }
         return noErr
@@ -687,6 +704,9 @@ final class CoreAudioOutput {
     var deviceUID: String = "Default"
     /// Linear gain applied in the render callback (0…1). Realtime-safe scalar.
     var gain: Float = 1.0
+    /// Smoothed RMS / peak level meter — observes the post-gain output
+    /// samples (i.e. what the speaker actually hears).
+    let outputMeter = LevelMeter()
 
     init(ringCapacityFrames: Int = 48_000 /* 1s @ 48kHz mono */) {
         self.ring = FloatRingBuffer(capacity: ringCapacityFrames)
@@ -868,10 +888,12 @@ final class CoreAudioOutput {
         // Interleave mono → N channels with gain.
         for i in 0..<n {
             let v = mixScratch[i] * g
+            mixScratch[i] = v   // store back so the meter sees post-gain
             for c in 0..<chans {
                 dst[i * chans + c] = v
             }
         }
+        outputMeter.observe(mixScratch, count: n)
         return noErr
     }
 }

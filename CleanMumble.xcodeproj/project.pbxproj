@@ -10,6 +10,7 @@
 		A6279F882E8450820036F35B /* Copus in Frameworks */ = {isa = PBXBuildFile; productRef = A6279F862E8450820036F35B /* Copus */; };
 		A6279F892E8450820036F35B /* Opus in Frameworks */ = {isa = PBXBuildFile; productRef = A6279F872E8450820036F35B /* Opus */; };
 		CC1E000100000000000A0003 /* OpusControl in Frameworks */ = {isa = PBXBuildFile; productRef = CC1E000100000000000A0002 /* OpusControl */; };
+		CC1E000200000000000A0003 /* AudioCore in Frameworks */ = {isa = PBXBuildFile; productRef = CC1E000200000000000A0002 /* AudioCore */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -61,6 +62,7 @@
 				A6279F882E8450820036F35B /* Copus in Frameworks */,
 				A6279F892E8450820036F35B /* Opus in Frameworks */,
 				CC1E000100000000000A0003 /* OpusControl in Frameworks */,
+				CC1E000200000000000A0003 /* AudioCore in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -124,6 +126,7 @@
 				A6279F862E8450820036F35B /* Copus */,
 				A6279F872E8450820036F35B /* Opus */,
 				CC1E000100000000000A0002 /* OpusControl */,
+				CC1E000200000000000A0002 /* AudioCore */,
 			);
 			productName = CleanMumble;
 			productReference = A6279F532E8450810036F35B /* CleanMumble.app */;
@@ -210,6 +213,7 @@
 			packageReferences = (
 				A6279F852E8450820036F35B /* XCRemoteSwiftPackageReference "swift-opus" */,
 				CC1E000100000000000A0001 /* XCLocalSwiftPackageReference "Packages/OpusControl" */,
+				CC1E000200000000000A0001 /* XCLocalSwiftPackageReference "Packages/AudioCore" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = A6279F542E8450810036F35B /* Products */;
@@ -415,6 +419,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleIconName = AppIcon;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "CleanMumble needs microphone access to transmit your voice in channels.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -462,6 +467,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleIconName = AppIcon;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "CleanMumble needs microphone access to transmit your voice in channels.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -643,6 +649,10 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = Packages/OpusControl;
 		};
+		CC1E000200000000000A0001 /* XCLocalSwiftPackageReference "Packages/AudioCore" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/AudioCore;
+		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCRemoteSwiftPackageReference section */
@@ -671,6 +681,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = CC1E000100000000000A0001 /* XCLocalSwiftPackageReference "Packages/OpusControl" */;
 			productName = OpusControl;
+		};
+		CC1E000200000000000A0002 /* AudioCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = CC1E000200000000000A0001 /* XCLocalSwiftPackageReference "Packages/AudioCore" */;
+			productName = AudioCore;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

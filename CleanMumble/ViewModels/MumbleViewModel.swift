@@ -9,6 +9,7 @@ import Foundation
 import SwiftUI
 import Combine
 import AVFoundation
+import AudioCore
 
 @MainActor
 class MumbleViewModel: ObservableObject {
@@ -25,6 +26,13 @@ class MumbleViewModel: ObservableObject {
     @Published var isSpeaking: Bool = false
     @Published var inputVolume: Float = 1.0
     @Published var outputVolume: Float = 1.0
+    /// Smoothed RMS of the microphone input (post-gain), 0…1. Updated by a
+    /// 33 ms timer while connected so a VU meter in the UI stays current.
+    @Published var micLevelRMS: Float = 0
+    @Published var micLevelPeak: Float = 0
+    /// Smoothed RMS of the playback output (what other speakers sound like).
+    @Published var outputLevelRMS: Float = 0
+    @Published var outputLevelPeak: Float = 0
     @Published var userPreferences: UserPreferences = UserPreferences()
     @Published var chatMessages: [ChatMessage] = []
     
@@ -53,6 +61,9 @@ class MumbleViewModel: ObservableObject {
     private var audioEngine: AVAudioEngine?
     private var mumbleProtocol: MumbleProtocolHandler?
     private var realMumbleClient: RealMumbleClient?
+    /// Drives the @Published mic / output level properties at ~30 Hz while
+    /// connected. Stopped on disconnect so we don't churn on the main thread.
+    private var levelMeterTimer: Timer?
     #if os(iOS)
     private var audioSession: AVAudioSession?
     #endif
@@ -61,9 +72,12 @@ class MumbleViewModel: ObservableObject {
     init() {
         loadServers()
         loadUserPreferences()
-        setupAudioSession()
+        // NOTE: We deliberately do NOT activate AVAudioSession here. Doing so
+        // at launch interrupts whatever music / podcast / call the user is
+        // listening to. The session is activated only when the user actually
+        // connects to a server, and deactivated again on disconnect.
         // Don't load sample data by default - let server data populate the UI
-        
+
         // Auto-add magical.rocks server if not present
         addMagicalRocksServerIfNeeded()
     }
@@ -117,7 +131,35 @@ class MumbleViewModel: ObservableObject {
     func connectToServer(_ server: ServerConnectionInfo) {
         currentServer = server
         connectionState = .connecting
-        
+
+        #if os(iOS)
+        // Activate the iOS audio session ONLY now — not at app launch — so
+        // background music / podcasts aren't interrupted while the app sits
+        // idle. Wire interruption + route-change handlers so a phone call /
+        // headphone unplug cleanly stops & resumes the audio engine.
+        IOSAudioSession.shared.onInterruption = { [weak self] began, shouldResume in
+            guard let self else { return }
+            if began {
+                self.realMumbleClient?.stopAudioEngine()
+            } else if shouldResume {
+                self.realMumbleClient?.setupAudioEngine()
+                self.realMumbleClient?.startAudioEngine()
+            }
+        }
+        IOSAudioSession.shared.onRouteChange = { [weak self] in
+            // The CoreAudioIO path (macOS) handles routing internally via AU
+            // listeners. On iOS, AVAudioEngine doesn't restart cleanly on a
+            // route change, so we rebuild the graph.
+            guard let client = self?.realMumbleClient else { return }
+            client.stopAudioEngine()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                client.setupAudioEngine()
+                client.startAudioEngine()
+            }
+        }
+        IOSAudioSession.shared.activateForVoiceChat()
+        #endif
+
         // Create real Mumble client
         realMumbleClient = RealMumbleClient()
         
@@ -182,12 +224,14 @@ class MumbleViewModel: ObservableObject {
         
         // Start connection
         realMumbleClient?.connect(to: server.host, port: UInt16(server.port), username: server.username, password: server.password)
+        startLevelMeterTimer()
     }
-    
+
     func disconnect() {
         realMumbleClient?.disconnect()
         realMumbleClient = nil
         cancellables.removeAll()
+        stopLevelMeterTimer()
         connectionState = .disconnected
         isConnected = false
         currentServer = nil
@@ -196,6 +240,10 @@ class MumbleViewModel: ObservableObject {
         currentChannel = nil
         chatMessages = []
         stopAudioEngine()
+        #if os(iOS)
+        // Hand the audio focus back to whatever app was playing before us.
+        IOSAudioSession.shared.deactivate()
+        #endif
     }
     
     // MARK: - Channel Management
@@ -227,7 +275,11 @@ class MumbleViewModel: ObservableObject {
     }
 
     func setInputVolume(_ volume: Float) {
-        inputVolume = max(0.0, min(1.0, volume))
+        // 0 \u2026 4 = up to +12 dB pre-encoder gain. Clamped further inside the
+        // GainProcessor (hard cap at 8\u00d7) for safety.
+        let v = max(0.0, min(4.0, volume))
+        inputVolume = v
+        realMumbleClient?.inputGain = v
     }
 
     func setOutputVolume(_ volume: Float) {
@@ -335,18 +387,35 @@ class MumbleViewModel: ObservableObject {
     }
     
     private func setupAudioSession() {
-        #if os(iOS)
-        audioSession = AVAudioSession.sharedInstance()
-        do {
-            try audioSession?.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
-            try audioSession?.setActive(true)
-        } catch {
-            print("Failed to setup audio session: \(error)")
+        // No-op now — the iOS audio session is activated lazily inside
+        // `connectToServer(_:)` so we don't interrupt other audio at launch.
+        // Kept as a hook in case macOS-specific setup is needed later.
+    }
+
+    // MARK: - Live level metering (mic + output VU)
+    private func startLevelMeterTimer() {
+        stopLevelMeterTimer()
+        // 30 Hz → smooth without flooding the main thread.
+        levelMeterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0,
+                                               repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshLevelMeters() }
         }
-        #else
-        // macOS audio setup would go here
-        print("Setting up macOS audio")
-        #endif
+    }
+
+    private func stopLevelMeterTimer() {
+        levelMeterTimer?.invalidate(); levelMeterTimer = nil
+        micLevelRMS = 0; micLevelPeak = 0
+        outputLevelRMS = 0; outputLevelPeak = 0
+    }
+
+    private func refreshLevelMeters() {
+        guard let io = realMumbleClient?.coreAudioIOForUI else { return }
+        let micR = io.input.inputMeter.snapshot()
+        micLevelRMS = micR.rms
+        micLevelPeak = micR.peakHold
+        let outR = io.output.outputMeter.snapshot()
+        outputLevelRMS = outR.rms
+        outputLevelPeak = outR.peakHold
     }
     
     private func updateAudioEngine() {
