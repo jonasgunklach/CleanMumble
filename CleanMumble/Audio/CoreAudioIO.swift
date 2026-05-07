@@ -120,9 +120,19 @@ private func resolveDeviceID(uid: String, isInput: Bool) -> AudioDeviceID? {
 }
 
 private func findHALOutputComponent() -> AudioComponent? {
+    return findOutputComponent(voiceProcessing: false)
+}
+
+/// Returns the AUHAL component when `voiceProcessing` is false, or the
+/// VoiceProcessingIO unit (Apple's voice-comms AU with built-in NS / AGC /
+/// AEC) when true. Both are I/O units exposing the same enable-IO / device
+/// binding / stream-format properties, so the call sites can swap subtypes
+/// without changing any other property setup.
+private func findOutputComponent(voiceProcessing: Bool) -> AudioComponent? {
     var desc = AudioComponentDescription(
         componentType:         kAudioUnitType_Output,
-        componentSubType:      kAudioUnitSubType_HALOutput,
+        componentSubType:      voiceProcessing ? kAudioUnitSubType_VoiceProcessingIO
+                                               : kAudioUnitSubType_HALOutput,
         componentManufacturer: kAudioUnitManufacturer_Apple,
         componentFlags:        0,
         componentFlagsMask:    0
@@ -228,6 +238,11 @@ final class CoreAudioInput {
     private var bufList = AudioBufferList()
     private var scratch: UnsafeMutablePointer<Float>?
     private var scratchFrames: Int = 0
+    /// AVAudioEngine-based VPIO backend. Used in place of the raw AUHAL path
+    /// whenever voice processing is requested — it's the only way Apple's
+    /// VPIO works reliably on Bluetooth devices (AirPods etc.). nil when
+    /// running on the raw AUHAL path.
+    fileprivate var engineBackend: VPIOEngineInput?
     private(set) var isRunning: Bool = false
     /// Mach-time of the most recent successful `start()`. Property-change
     /// notifications fired within `kHotswapSuppressionSeconds` of this point
@@ -254,12 +269,20 @@ final class CoreAudioInput {
     /// Called from the audio render thread with one chunk of mono Float32 PCM.
     /// Implementations MUST be realtime-safe (no allocations / locks / Swift
     /// runtime calls beyond pointer arithmetic and `DispatchQueue.async`).
-    var onSamples: ((UnsafePointer<Float>, Int) -> Void)?
+    var onSamples: ((UnsafePointer<Float>, Int) -> Void)? {
+        didSet { engineBackend?.onSamples = onSamples }
+    }
 
     /// Called on the main queue when the input device or stream format
     /// changes and the input has restarted (or failed to). Use it to refresh
     /// any cached format info.
-    var onRestart: (() -> Void)?
+    var onRestart: (() -> Void)? {
+        didSet {
+            // Forward; rewrap so the backend → CoreAudioInput → caller chain
+            // stays valid even if the caller swaps closures.
+            engineBackend?.onRestart = { [weak self] in self?.onRestart?() }
+        }
+    }
 
     /// Linear input gain applied AFTER resampling, BEFORE delivery to
     /// `onSamples`. Adjustable from any thread; the render callback reads it
@@ -276,16 +299,98 @@ final class CoreAudioInput {
     /// The UID requested by the user ("Default" / "" → system default).
     var deviceUID: String = "Default"
 
+    /// Companion output device UID. Used ONLY by the engine VPIO backend so
+    /// it can pin BOTH ends of the duplex VPIO unit to matching HAL device
+    /// ids — required for AirPods / BT to negotiate the HFP link. The plain
+    /// AUHAL input path ignores this. Set by the owner (CoreAudioIO facade).
+    var outputDeviceUID: String = "Default"
+
+    /// VPIO selection policy. `.auto` queries the resolved input device's
+    /// transport type (built-in / Bluetooth → ON, studio interface / aggregate
+    /// → OFF). `.on` / `.off` force the choice. Must be set BEFORE `start()`.
+    enum VoiceProcessingMode { case auto, on, off }
+    var voiceProcessingMode: VoiceProcessingMode = .auto
+
+    /// Back-compat shim for callers that still poke a Bool. Maps to `.on`/`.off`.
+    var useVoiceProcessing: Bool {
+        get {
+            switch voiceProcessingMode {
+            case .on:   return true
+            case .off:  return false
+            case .auto: return effectiveVoiceProcessing
+            }
+        }
+        set { voiceProcessingMode = newValue ? .on : .off }
+    }
+
+    /// Result of the most recent `auto` evaluation — read by status UI.
+    /// Updated inside `start()` once the device has been resolved.
+    private(set) var effectiveVoiceProcessing: Bool = false
+    private(set) var lastTransportInfo: AudioDeviceTransportInfo?
+
+    /// VPIO sub-property: enable Apple's automatic gain control. No effect
+    /// when VPIO isn't running. Settable any time; applied at next `start()`
+    /// or immediately if the AU is already up.
+    var enableAGC: Bool = true {
+        didSet { applyVPIOSubProperties() }
+    }
+    /// When `true`, bypass NS/AEC inside VPIO (rarely useful — exposed for
+    /// debugging only; VPIO with NS off still gives you AEC + AGC).
+    var bypassNoiseSuppressionAndAEC: Bool = false {
+        didSet { applyVPIOSubProperties() }
+    }
+
     func start() {
         stop()
-        guard let comp = findHALOutputComponent() else {
-            print("[CAInput] AUHAL not found"); return
-        }
         guard let dev = resolveDeviceID(uid: deviceUID, isInput: true) else {
             print("[CAInput] Could not resolve input device for UID '\(deviceUID)'")
             return
         }
         deviceID = dev
+
+        // Resolve VPIO policy now that we know which device we're opening.
+        let info = AudioDeviceTransportInfo.query(dev)
+        lastTransportInfo = info
+        let voiceProcessing: Bool
+        switch voiceProcessingMode {
+        case .on:   voiceProcessing = true
+        case .off:  voiceProcessing = false
+        case .auto: voiceProcessing = info.recommendVoiceProcessing
+        }
+        effectiveVoiceProcessing = voiceProcessing
+        print("[CAInput] Device='\(info.name)' transport=\(info.transport) " +
+              "voiceMode=\(info.voiceMode) → VPIO=\(voiceProcessing) (mode=\(voiceProcessingMode))")
+
+        // ---- VPIO path: delegate to AVAudioEngine -----------------------
+        // Apple's voice processing only works reliably on macOS through
+        // AVAudioEngine.inputNode.setVoiceProcessingEnabled(true). Going
+        // direct to a kAudioUnitSubType_VoiceProcessingIO AUHAL fails on
+        // Bluetooth devices (error -10875) because raw AUHAL has no hook
+        // to coordinate the BT mode-switch. Hand the work to the engine.
+        if voiceProcessing {
+            let backend = VPIOEngineInput(gain: inputGainProcessor, meter: inputMeter)
+            backend.deviceUID                     = deviceUID
+            backend.outputDeviceUID               = outputDeviceUID
+            backend.enableAGC                     = enableAGC
+            backend.bypassNoiseSuppressionAndAEC  = bypassNoiseSuppressionAndAEC
+            backend.onSamples                     = onSamples
+            backend.onRestart                     = { [weak self] in self?.onRestart?() }
+            do {
+                try backend.start()
+                engineBackend = backend
+                isRunning     = true
+                return
+            } catch {
+                print("[CAInput] VPIO engine start failed: \(error) — falling back to raw HAL")
+                effectiveVoiceProcessing = false
+                // fall through to AUHAL path with vp=false
+            }
+        }
+
+        let voiceProcessingForAU = false
+        guard let comp = findOutputComponent(voiceProcessing: voiceProcessingForAU) else {
+            print("[CAInput] AU not found (vp=\(voiceProcessingForAU))"); return
+        }
 
         var au: AudioUnit?
         var err = AudioComponentInstanceNew(comp, &au)
@@ -294,15 +399,22 @@ final class CoreAudioInput {
         }
 
         // Enable input on bus 1; disable output on bus 0.
+        // Exception: VoiceProcessingIO is a duplex unit — disabling its output
+        // bus prevents `AudioUnitInitialize` from succeeding. We leave bus 0
+        // enabled and don't install an output callback (the unit renders
+        // silence on its own); the parallel `CoreAudioOutput` AU still drives
+        // the user's chosen output device.
         var enable: UInt32 = 1
         err = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO,
                                    kAudioUnitScope_Input, 1, &enable, UInt32(MemoryLayout<UInt32>.size))
         guard err == noErr else { print("[CAInput] enableIO(input) failed: \(err)"); dispose(unit); return }
 
-        var disable: UInt32 = 0
-        err = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO,
-                                   kAudioUnitScope_Output, 0, &disable, UInt32(MemoryLayout<UInt32>.size))
-        guard err == noErr else { print("[CAInput] enableIO(output off) failed: \(err)"); dispose(unit); return }
+        if !voiceProcessingForAU {
+            var disable: UInt32 = 0
+            err = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO,
+                                       kAudioUnitScope_Output, 0, &disable, UInt32(MemoryLayout<UInt32>.size))
+            guard err == noErr else { print("[CAInput] enableIO(output off) failed: \(err)"); dispose(unit); return }
+        }
 
         // Bind the chosen device.
         var devID = dev
@@ -400,7 +512,20 @@ final class CoreAudioInput {
         bufList.mBuffers.mData           = UnsafeMutableRawPointer(p)
 
         err = AudioUnitInitialize(unit)
-        guard err == noErr else { print("[CAInput] AudioUnitInitialize failed: \(err)"); dispose(unit); return }
+        guard err == noErr else {
+            print("[CAInput] AudioUnitInitialize failed: \(err) (vp=\(voiceProcessingForAU))")
+            dispose(unit)
+            // We never reach this path with VPIO enabled (the engine backend
+            // handles VPIO entirely). If a future change re-introduces the
+            // option of running VPIO via AUHAL, this is where the auto-fallback
+            // would live. For now: just log and bail.
+            return
+        }
+
+        // Configure VPIO sub-properties (AGC / NS-bypass / ducking). No-op when
+        // we're not actually running on VPIO.
+        self.au = unit
+        applyVPIOSubProperties()
 
         // Install render callback AFTER AudioUnitInitialize — installing it
         // earlier on an uninitialised AU is a known cause of "AU starts but
@@ -428,9 +553,8 @@ final class CoreAudioInput {
                                        caInputDefaultDeviceChanged,
                                        Unmanaged.passUnretained(self).toOpaque())
 
-        // Stash the AU pointer BEFORE start so the render callback can deref
-        // it on its very first invocation.
-        self.au = unit
+        // (self.au already assigned above so VPIO sub-properties can be set
+        // — and so the render callback can deref it on first invocation.)
 
         // Retry start on EAGAIN (HAL error 35 = device temporarily busy,
         // typically because another AU on the same device hasn't fully
@@ -460,7 +584,7 @@ final class CoreAudioInput {
                                 &postFmt, &postSize) == noErr {
             self.lastFormat = postFmt
         }
-        print("[CAInput] Started on device id \(dev) (UID '\(deviceUID)')")
+        print("[CAInput] Started on device id \(dev) (UID '\(deviceUID)', vp=\(voiceProcessingForAU))")
 
         // Watchdog: ~1s after start, check that the AU is actually delivering
         // buffers. If not, it "started" but the HAL refused IO (the bug we've
@@ -481,6 +605,13 @@ final class CoreAudioInput {
     }
 
     func stop() {
+        if let backend = engineBackend {
+            backend.stop()
+            engineBackend = nil
+            isRunning = false
+            print("[CAInput] Stopped (engine VPIO backend)")
+            return
+        }
         guard let unit = au else { return }
         AudioOutputUnitStop(unit)
         AudioUnitRemovePropertyListenerWithUserData(unit, kAudioUnitProperty_StreamFormat,
@@ -520,6 +651,25 @@ final class CoreAudioInput {
 
     private func dispose(_ unit: AudioUnit) {
         AudioComponentInstanceDispose(unit)
+    }
+
+    /// Push current AGC / NS-bypass / ducking knobs to the AU. Idempotent and
+    /// silent when the running AU isn't VPIO.
+    fileprivate func applyVPIOSubProperties() {
+        if let backend = engineBackend {
+            backend.enableAGC = enableAGC
+            backend.bypassNoiseSuppressionAndAEC = bypassNoiseSuppressionAndAEC
+            backend.applyVPIOSubProperties()
+            return
+        }
+        guard let unit = au, effectiveVoiceProcessing else { return }
+        var agc: UInt32 = enableAGC ? 1 : 0
+        AudioUnitSetProperty(unit, kAUVoiceIOProperty_VoiceProcessingEnableAGC,
+                             kAudioUnitScope_Global, 0, &agc, UInt32(MemoryLayout<UInt32>.size))
+        var bypass: UInt32 = bypassNoiseSuppressionAndAEC ? 1 : 0
+        AudioUnitSetProperty(unit, kAUVoiceIOProperty_BypassVoiceProcessing,
+                             kAudioUnitScope_Global, 0, &bypass, UInt32(MemoryLayout<UInt32>.size))
+        print("[CAInput] VPIO sub-props applied: AGC=\(enableAGC) bypassNS/AEC=\(bypassNoiseSuppressionAndAEC)")
     }
 
     /// Called from a property listener (off the audio thread). We bounce to
@@ -692,7 +842,27 @@ private func caInputDefaultDeviceChanged(inObjectID: AudioObjectID,
 final class CoreAudioOutput {
     private var au: AudioUnit?
     private var outputChannels: UInt32 = 2
+    /// Legacy single-producer ring — retained so any existing caller that
+    /// uses `enqueuePlayback(_:count:)` (no sender id) still works. New code
+    /// should use `enqueuePlayback(_:count:sender:)` which routes to the
+    /// per-sender ring set below.
     let ring: FloatRingBuffer
+    /// Per-sender rings. JitterBuffer for each remote user writes into its
+    /// own ring; the render callback mixes them. This avoids the
+    /// SP/SC-violation that occurs when N JitterBuffers concurrently write
+    /// into a single ring (which sounds like "scratches" because writes
+    /// concatenate at 2× the consume rate → ring overflow drops oldest
+    /// data continuously).
+    private var senderRings: [Int32: FloatRingBuffer] = [:]
+    private let senderRingsLock = os_unfair_lock_t.allocate(capacity: 1)
+    private let senderRingCapacity: Int
+    /// Diagnostics — counters for tracking the playback pipeline.
+    private var enqueueCallsBySender: [Int32: Int] = [:]
+    private var renderCallCount: Int = 0
+    private var renderNonZeroCount: Int = 0
+    private var lastRenderLogHostTime: UInt64 = 0
+    /// Per-render scratch for one sender's pulled audio (mono, then summed).
+    private var senderScratch: UnsafeMutablePointer<Float>?
     private var mixScratch: UnsafeMutablePointer<Float>?
     private var mixScratchFrames: Int = 0
     private(set) var isRunning: Bool = false
@@ -710,6 +880,62 @@ final class CoreAudioOutput {
 
     init(ringCapacityFrames: Int = 48_000 /* 1s @ 48kHz mono */) {
         self.ring = FloatRingBuffer(capacity: ringCapacityFrames)
+        // Per-sender rings are intentionally MUCH smaller than the legacy
+        // single ring: capping at ~200ms keeps round-trip latency bounded
+        // when a producer outpaces the consumer (e.g. JitterBuffer PLC
+        // emitting 20ms decoded frames every 10ms tick → 2× fill rate).
+        // When the ring is full new writes drop oldest, so the worst-case
+        // perceived latency is ~200ms + the JB target depth.
+        self.senderRingCapacity = 9_600 // 200ms @ 48kHz mono
+        senderRingsLock.initialize(to: os_unfair_lock())
+    }
+
+    deinit {
+        senderRingsLock.deinitialize(count: 1)
+        senderRingsLock.deallocate()
+    }
+
+    /// Per-sender enqueue. Each sender writes into its own ring so the render
+    /// callback can mix N talkers without contention.
+    func enqueue(_ samples: UnsafePointer<Float>, count: Int, sender: Int32) {
+        os_unfair_lock_lock(senderRingsLock)
+        let ring: FloatRingBuffer
+        let isNew: Bool
+        if let existing = senderRings[sender] {
+            ring = existing
+            isNew = false
+        } else {
+            ring = FloatRingBuffer(capacity: senderRingCapacity)
+            senderRings[sender] = ring
+            isNew = true
+        }
+        let n = (enqueueCallsBySender[sender] ?? 0) &+ 1
+        enqueueCallsBySender[sender] = n
+        os_unfair_lock_unlock(senderRingsLock)
+        ring.write(samples, count: count)
+        if isNew || n == 50 || n % 250 == 0 {
+            // Compute a quick RMS of this chunk so we can verify the data is non-silent.
+            var sumSq: Float = 0
+            for i in 0..<count { sumSq += samples[i] * samples[i] }
+            let rms = sqrtf(sumSq / Float(max(count, 1)))
+            print("[CAOutput][DIAG] enqueue sender=\(sender) call#\(n) count=\(count) rms=\(String(format: "%.4f", rms)) ringsCount=\(senderRings.count)")
+        }
+    }
+
+    /// Drop the per-sender ring for a user that left the channel.
+    func removeSender(_ sender: Int32) {
+        os_unfair_lock_lock(senderRingsLock)
+        senderRings.removeValue(forKey: sender)
+        os_unfair_lock_unlock(senderRingsLock)
+    }
+
+    /// Snapshot of all current sender rings; used by the render callback.
+    /// O(n_senders) but n_senders is tiny (≤0 for typical voice chats).
+    fileprivate func snapshotRings() -> [FloatRingBuffer] {
+        os_unfair_lock_lock(senderRingsLock)
+        let copy = Array(senderRings.values)
+        os_unfair_lock_unlock(senderRingsLock)
+        return copy
     }
 
     func start() {
@@ -778,6 +1004,10 @@ final class CoreAudioOutput {
         p.initialize(repeating: 0, count: scratchCap)
         mixScratch = p
         mixScratchFrames = scratchCap
+        // Per-sender pull scratch (mono); summed into mixScratch.
+        let s = UnsafeMutablePointer<Float>.allocate(capacity: scratchCap)
+        s.initialize(repeating: 0, count: scratchCap)
+        senderScratch = s
 
         // Property listeners.
         AudioUnitAddPropertyListener(unit, kAudioUnitProperty_StreamFormat,
@@ -832,9 +1062,17 @@ final class CoreAudioOutput {
             s.deinitialize(count: mixScratchFrames)
             s.deallocate()
             mixScratch = nil
-            mixScratchFrames = 0
         }
+        if let s = senderScratch {
+            s.deinitialize(count: mixScratchFrames)
+            s.deallocate()
+            senderScratch = nil
+        }
+        mixScratchFrames = 0
         ring.clear()
+        os_unfair_lock_lock(senderRingsLock)
+        senderRings.removeAll()
+        os_unfair_lock_unlock(senderRingsLock)
         print("[CAOutput] Stopped")
     }
 
@@ -866,11 +1104,12 @@ final class CoreAudioOutput {
         }
     }
 
-    /// Realtime: pull mono PCM from the ring, fan out to `outputChannels` interleaved.
+    /// Realtime: pull mono PCM from every per-sender ring (mixing them
+    /// additively), then fan out to `outputChannels` interleaved.
     fileprivate func render(_ ioData: UnsafeMutablePointer<AudioBufferList>?,
                             frames: UInt32) -> OSStatus
     {
-        guard let ioData, let mixScratch else { return -1 }
+        guard let ioData, let mixScratch, let senderScratch else { return -1 }
         let abl = UnsafeMutableAudioBufferListPointer(ioData)
         guard let ab = abl.first, let dst = ab.mData?.assumingMemoryBound(to: Float.self)
         else { return -1 }
@@ -882,18 +1121,68 @@ final class CoreAudioOutput {
             (dst).update(repeating: 0, count: Int(ab.mDataByteSize) / 4)
             return noErr
         }
-        ring.read(into: mixScratch, count: n)
+
+        // 1) Start with silence in the mix bus.
+        mixScratch.update(repeating: 0, count: n)
+
+        // 2) Mix the legacy single-producer ring (kept for backwards compat
+        //    with any caller that doesn't pass a sender id).
+        ring.read(into: senderScratch, count: n)
+        for i in 0..<n { mixScratch[i] += senderScratch[i] }
+
+        // 3) Mix every per-sender ring. snapshotRings() does one short
+        //    unfair-lock acquire — fine on the audio thread for tiny N.
+        for r in snapshotRings() {
+            r.read(into: senderScratch, count: n)
+            for i in 0..<n { mixScratch[i] += senderScratch[i] }
+        }
+
+        // 4) Apply gain, soft-clip on the way out, fan to channels.
+        //    The soft clipper uses tanh-like compression: it leaves |v|<0.7
+        //    untouched and asymptotes to ±1.0 for large inputs. This avoids
+        //    the harsh "fuzz" you get from naive `min(1, max(-1, v))` when
+        //    multiple talkers' peaks sum past unity.
         let g = gain
         let chans = Int(outputChannels)
-        // Interleave mono → N channels with gain.
         for i in 0..<n {
-            let v = mixScratch[i] * g
-            mixScratch[i] = v   // store back so the meter sees post-gain
+            var v = mixScratch[i] * g
+            // Cheap soft clip via rational approximation of tanh:
+            //   f(v) = v / (1 + |v|^2 / 3)  for |v| < ~1.5  (close to tanh)
+            // then clamp the rare outliers. Output is monotonic and
+            // never collapses to zero.
+            let av = abs(v)
+            if av > 0.7 {
+                let scaled = v / (1.0 + (av - 0.7) * 1.5)
+                v = max(-0.98, min(0.98, scaled))
+            }
+            mixScratch[i] = v
             for c in 0..<chans {
                 dst[i * chans + c] = v
             }
         }
         outputMeter.observe(mixScratch, count: n)
+        // Throttled diag: log render activity once per ~2s with peak/RMS so we
+        // can confirm whether the render bus is actually receiving samples.
+        renderCallCount &+= 1
+        var peak: Float = 0
+        var sumSq: Float = 0
+        for i in 0..<n {
+            let a = abs(mixScratch[i])
+            if a > peak { peak = a }
+            sumSq += mixScratch[i] * mixScratch[i]
+        }
+        if peak > 0.0001 { renderNonZeroCount &+= 1 }
+        let nowHost = mach_absolute_time()
+        if lastRenderLogHostTime == 0 { lastRenderLogHostTime = nowHost }
+        // ~2s @ 1e9 ns and timebase ≈ 1 ns/tick on Apple Silicon. We tolerate slight drift.
+        if nowHost &- lastRenderLogHostTime > 2_000_000_000 {
+            let rms = sqrtf(sumSq / Float(max(n, 1)))
+            let snap = snapshotRings()
+            print("[CAOutput][DIAG] render calls=\(renderCallCount) nonZero=\(renderNonZeroCount) lastPeak=\(String(format: "%.4f", peak)) lastRMS=\(String(format: "%.4f", rms)) gain=\(String(format: "%.2f", gain)) senderRings=\(snap.count)")
+            renderCallCount = 0
+            renderNonZeroCount = 0
+            lastRenderLogHostTime = nowHost
+        }
         return noErr
     }
 }
@@ -951,9 +1240,44 @@ final class CoreAudioIO {
         get { output.deviceUID }
         set { output.deviceUID = newValue }
     }
+    /// Forward to the input AU. See `CoreAudioInput.useVoiceProcessing`.
+    var useVoiceProcessing: Bool {
+        get { input.useVoiceProcessing }
+        set { input.useVoiceProcessing = newValue }
+    }
+    var voiceProcessingMode: CoreAudioInput.VoiceProcessingMode {
+        get { input.voiceProcessingMode }
+        set { input.voiceProcessingMode = newValue }
+    }
+    var enableAGC: Bool {
+        get { input.enableAGC }
+        set { input.enableAGC = newValue }
+    }
+    var bypassNoiseSuppressionAndAEC: Bool {
+        get { input.bypassNoiseSuppressionAndAEC }
+        set { input.bypassNoiseSuppressionAndAEC = newValue }
+    }
+    /// Status read-back for UI: nil until `start()` resolves the device.
+    var transportInfo: AudioDeviceTransportInfo? { input.lastTransportInfo }
+    var effectiveVoiceProcessing: Bool { input.effectiveVoiceProcessing }
 
     func start() {
+        // Make sure the engine VPIO backend (when chosen) can pin BOTH ends
+        // of the duplex unit to matching device ids.
+        input.outputDeviceUID = output.deviceUID
         input.start()
+        // When the input is running on the AVAudioEngine VPIO backend, the
+        // SAME duplex unit owns both directions of the (Bluetooth) device.
+        // Spinning up a separate AUHAL output on the same device fights
+        // VPIO for the BT HFP stream and starves its downlink reference,
+        // which makes the mic come out as silence. Route playback through
+        // the engine instead.
+        if input.engineBackend != nil {
+            input.engineBackend?.outputGain = output.gain
+            input.engineBackend?.outputMeter = output.outputMeter
+            // output.start() intentionally skipped; engine owns playback.
+            return
+        }
         output.start()
     }
 
@@ -962,9 +1286,37 @@ final class CoreAudioIO {
         output.stop()
     }
 
-    /// Submit decoded mono Float32 PCM @ 48 kHz for playback.
+    /// Submit decoded mono Float32 PCM @ 48 kHz for playback. Legacy entry
+    /// point: writes into the shared single-producer ring (do NOT call
+    /// concurrently from multiple senders — use the `sender:` overload).
     func enqueuePlayback(_ samples: UnsafePointer<Float>, count: Int) {
+        if let backend = input.engineBackend {
+            backend.enqueuePlayback(samples, count: count)
+            return
+        }
         output.ring.write(samples, count: count)
+    }
+
+    /// Per-sender submit. Each remote user's JitterBuffer should call this
+    /// with its userId so the render callback can mix them additively
+    /// instead of clobbering them in a single shared ring.
+    func enqueuePlayback(_ samples: UnsafePointer<Float>, count: Int, sender: Int32) {
+        if let backend = input.engineBackend {
+            // The engine VPIO backend currently has only one playback ring.
+            // Mixing multiple senders into one ring there has the same
+            // problem as the legacy AUHAL path; for now the BT-skipped-VPIO
+            // policy means the engine path is rarely hit, but if we
+            // re-enable it for built-in mics with multiple talkers we'll
+            // need to teach VPIOEngineInput about per-sender rings too.
+            backend.enqueuePlayback(samples, count: count)
+            return
+        }
+        output.enqueue(samples, count: count, sender: sender)
+    }
+
+    /// Notify that a user left so we can drop their per-sender ring.
+    func removeSender(_ sender: Int32) {
+        output.removeSender(sender)
     }
 
     var isRunning: Bool { input.isRunning || output.isRunning }

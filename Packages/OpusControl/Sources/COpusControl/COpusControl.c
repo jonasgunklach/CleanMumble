@@ -32,3 +32,23 @@ int cm_opus_encoder_set_dtx(void *enc, int enabled) {
 int cm_opus_encoder_set_vbr(void *enc, int enabled) {
     return opus_encoder_ctl((OpusEncoder *)enc, OPUS_SET_VBR(enabled ? 1 : 0));
 }
+
+int cm_opus_encoder_set_lsb_depth(void *enc, int32_t bits) {
+    return opus_encoder_ctl((OpusEncoder *)enc, OPUS_SET_LSB_DEPTH(bits));
+}
+
+int cm_opus_encoder_set_prediction_disabled(void *enc, int disabled) {
+    return opus_encoder_ctl((OpusEncoder *)enc, OPUS_SET_PREDICTION_DISABLED(disabled ? 1 : 0));
+}
+
+int cm_opus_decode_float(void *dec,
+                         const unsigned char *data, int32_t len,
+                         float *pcm, int frame_size,
+                         int decode_fec) {
+    return opus_decode_float((OpusDecoder *)dec, data, len, pcm, frame_size,
+                             decode_fec ? 1 : 0);
+}
+
+int cm_opus_decoder_reset(void *dec) {
+    return opus_decoder_ctl((OpusDecoder *)dec, OPUS_RESET_STATE);
+}

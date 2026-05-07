@@ -69,16 +69,49 @@ enum AudioQuality: String, Codable, CaseIterable, Identifiable {
     }
 
     // Underlying Opus parameters
+    //   - Normal sits at 64 kbps to match the official Mumble client's
+    //     default range (60-72 kbps). At 40 kbps Opus VOIP is audibly
+    //     more compressed on consonants/sibilants.
+    //   - Crisp stays at 96 kbps but uses 20 ms frames + the standard VOIP
+    //     application (NOT restricted-low-delay). The low-delay mode
+    //     disables Opus's SILK speech layer, which makes voice sound worse
+    //     per kbps. 20 ms gives Opus the most coding efficiency.
     var bitrate: Int  { switch self { case .dataSaver: return 16_000
-                                      case .normal:    return 40_000
+                                      case .normal:    return 64_000
                                       case .crisp:     return 96_000 } }
     var frameMs: Int  { switch self { case .dataSaver: return 40
                                       case .normal:    return 20
-                                      case .crisp:     return 10 } }
-    var lowDelay: Bool { self == .crisp }
+                                      case .crisp:     return 20 } }
+    var lowDelay: Bool { false }
 }
 
 // MARK: - Audio Settings
+
+/// User-facing tri-state choice for the VoiceProcessingIO unit. `.auto` (the
+/// recommended default) lets the audio engine decide based on the resolved
+/// input device's transport type — ON for built-in mic + Bluetooth headsets
+/// (incl. AirPods), OFF for studio USB interfaces and aggregate devices.
+enum VoiceProcessingChoice: String, Codable, CaseIterable, Identifiable {
+    case auto, on, off
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .auto: return "Auto (recommended)"
+        case .on:   return "Always on"
+        case .off:  return "Off"
+        }
+    }
+    /// Bridge to the CoreAudio layer's tri-state so callers don't have to
+    /// import CoreAudio just to map the enum.
+    var toCAInputMode: CoreAudioInput.VoiceProcessingMode {
+        switch self {
+        case .auto: return .auto
+        case .on:   return .on
+        case .off:  return .off
+        }
+    }
+}
+
 struct AudioSettings: Codable {
     var inputVolume: Float = 1.0
     var outputVolume: Float = 1.0
@@ -91,6 +124,42 @@ struct AudioSettings: Codable {
     var voiceActivityThreshold: Float = 0.5
     var voiceActivityDelay: Float = 0.5
     var quality: AudioQuality = .normal
+    /// Tri-state: auto (default) / on / off. See `VoiceProcessingChoice`.
+    /// Migrated from the old Bool field; old saved Bool=false maps to .auto so
+    /// existing users get the new smart-default behaviour automatically.
+    var voiceProcessing: VoiceProcessingChoice = .auto
+
+    /// Back-compat shim for older code paths still reading a Bool. Returns
+    /// true for both `.auto` and `.on` (the auto path will further refine).
+    var useVoiceProcessing: Bool {
+        get { voiceProcessing != .off }
+        set { voiceProcessing = newValue ? .on : .off }
+    }
+
+    init() {}
+
+    /// Custom decoder so previously-serialized settings (without newly-added
+    /// fields like `useVoiceProcessing`) still decode cleanly with defaults.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.inputVolume = try c.decodeIfPresent(Float.self, forKey: .inputVolume) ?? 1.0
+        self.outputVolume = try c.decodeIfPresent(Float.self, forKey: .outputVolume) ?? 1.0
+        self.inputDevice = try c.decodeIfPresent(String.self, forKey: .inputDevice) ?? "Default"
+        self.outputDevice = try c.decodeIfPresent(String.self, forKey: .outputDevice) ?? "Default"
+        self.enableEchoCancellation = try c.decodeIfPresent(Bool.self, forKey: .enableEchoCancellation) ?? true
+        self.enableNoiseSuppression = try c.decodeIfPresent(Bool.self, forKey: .enableNoiseSuppression) ?? true
+        self.enableAutomaticGainControl = try c.decodeIfPresent(Bool.self, forKey: .enableAutomaticGainControl) ?? true
+        self.voiceActivityDetection = try c.decodeIfPresent(Bool.self, forKey: .voiceActivityDetection) ?? true
+        self.voiceActivityThreshold = try c.decodeIfPresent(Float.self, forKey: .voiceActivityThreshold) ?? 0.5
+        self.voiceActivityDelay = try c.decodeIfPresent(Float.self, forKey: .voiceActivityDelay) ?? 0.5
+        self.quality = try c.decodeIfPresent(AudioQuality.self, forKey: .quality) ?? .normal
+        // New tri-state field; if not present, fall through to auto.
+        if let choice = try c.decodeIfPresent(VoiceProcessingChoice.self, forKey: .voiceProcessing) {
+            self.voiceProcessing = choice
+        } else {
+            self.voiceProcessing = .auto
+        }
+    }
 }
 
 // MARK: - User Preferences

@@ -48,6 +48,20 @@ public extension Opus.Encoder {
         try perform { cm_opus_encoder_set_vbr($0, enabled ? 1 : 0) }
     }
 
+    /// Effective sample resolution hint. 16 = standard 16-bit PCM source
+    /// (which is what 48 kHz Float32 voice effectively contains after the
+    /// AGC/limiter chain). Helps the encoder skip unnecessary noise modelling
+    /// at low bitrates.
+    func setLSBDepth(_ bits: Int32) throws {
+        try perform { cm_opus_encoder_set_lsb_depth($0, bits) }
+    }
+
+    /// Disable predictive coding (CELT mode only). Reduces dependency between
+    /// frames — better packet-loss resilience at the cost of ~1–2 dB SNR.
+    func setPredictionDisabled(_ disabled: Bool) throws {
+        try perform { cm_opus_encoder_set_prediction_disabled($0, disabled ? 1 : 0) }
+    }
+
     // MARK: - Internal
 
     private func perform(_ op: (UnsafeMutableRawPointer) -> Int32) throws {

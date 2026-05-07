@@ -27,6 +27,7 @@ import CoreAudio
 import AudioToolbox
 import Opus
 import OpusControl
+import AudioCore
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Protobuf decoder
@@ -200,6 +201,10 @@ class RealMumbleClient: ObservableObject {
     /// Each remote user must have their own decoder context so the LPC
     /// predictor state for one speaker doesn't corrupt another speaker's audio.
     private var opusDecoders: [Int32: Opus.Decoder] = [:]
+    /// Per-speaker sequence-aware jitter buffers (CoreAudio path only). Owns
+    /// its decoder; we keep it separate from `opusDecoders` so the legacy
+    /// AVAudioEngine code path is untouched.
+    private var jitterBuffers: [Int32: JitterBuffer] = [:]
     /// Per-speaker scheduling state for the playback jitter buffer.
     /// `nextSampleTime` is the sample-time at which the *next* incoming buffer
     /// should be scheduled on the player. Maintaining this per speaker means
@@ -220,6 +225,29 @@ class RealMumbleClient: ObservableObject {
     var opusBitrate:  Int  = 40000   // bits/s
     var opusFrameMs:  Int  = 20      // 10 / 20 / 40 / 60 ms
     var opusLowDelay: Bool = false   // restricted low-delay application mode
+    /// Use Apple's `kAudioUnitSubType_VoiceProcessingIO` (NS + AGC + AEC) for
+    /// the input AU. Read once on `setupCoreAudioIO()` — changes take effect
+    /// on the next engine restart. UI restricts changes to the disconnected
+    /// state to avoid mid-call audio restarts. Default OFF; opt-in only
+    /// because VPIO + AirPods + parallel HAL output frequently fails on
+    /// Sonoma/Sequoia (CoreAudioInput has an auto-fallback when it does).
+    var useVoiceProcessing: Bool {
+        get { voiceProcessingMode == .on || (voiceProcessingMode == .auto) }
+        set { voiceProcessingMode = newValue ? .on : .off }
+    }
+    /// Tri-state VPIO selection. `.auto` (default) means "ON for built-in /
+    /// Bluetooth, OFF for studio USB / aggregate" — the same heuristic
+    /// Discord/Teams use. UI may force `.on` or `.off`.
+    var voiceProcessingMode: CoreAudioInput.VoiceProcessingMode = .auto
+    /// VPIO sub-knobs. `enableAGC` and `duckOtherAudio` are settable mid-call;
+    /// they're applied on the live AU through `applyVPIOSubProperties()`.
+    var enableAGC: Bool = true {
+        didSet { coreAudioIO?.enableAGC = enableAGC }
+    }
+    /// Pre-Opus DSP stages — built fresh on every `setupCoreAudioIO()`.
+    /// Held weakly only for diagnostics; the closure captures them strongly.
+    private var inputHighPass: BiquadFilter?
+    private var inputLimiter:  SoftLimiter?
     /// VAD trigger threshold as raw RMS (typ. 0.003 … 0.05). Settable from UI.
     var vadThreshold: Float = 0.008
     /// Linear input gain applied to the microphone before encoding. Default
@@ -269,6 +297,16 @@ class RealMumbleClient: ObservableObject {
     private var password = ""
 
     private var pingTimer: Timer?
+    private var lossAdaptTimer: Timer?
+
+    // MARK: - Connection-quality stats (read by SettingsView)
+    /// Most recent observed inbound packet loss percentage (0…100), summed
+    /// across all remote senders over the last adaptation window (~5 s).
+    @Published var observedInboundLossPercent: Int = 0
+    /// Current Opus encoder bitrate in bits per second after adaptation.
+    @Published var currentEncoderBitrate: Int = 0
+    /// Largest jitter-buffer target depth currently in use (ms).
+    @Published var currentJitterDepthMs: Int = 0
 
     // ─────────────────────────────────────────────────────────────────────────
     // MARK: - Connect / Disconnect
@@ -326,6 +364,7 @@ class RealMumbleClient: ObservableObject {
 
     func disconnect() {
         pingTimer?.invalidate(); pingTimer = nil
+        lossAdaptTimer?.invalidate(); lossAdaptTimer = nil
         speakingTimers.values.forEach { $0.invalidate() }
         speakingTimers.removeAll()
         stopAudioEngine()
@@ -699,7 +738,7 @@ class RealMumbleClient: ObservableObject {
         var pos = 1
         guard let (senderSession, sessionLen) = readMumbleVarInt(payload, at: pos) else { return }
         pos += sessionLen
-        guard let (_, seqLen) = readMumbleVarInt(payload, at: pos) else { return }
+        guard let (sequence, seqLen) = readMumbleVarInt(payload, at: pos) else { return }
         pos += seqLen
         guard let (rawLen, lenLen) = readMumbleVarInt(payload, at: pos) else { return }
         pos += lenLen
@@ -710,12 +749,14 @@ class RealMumbleClient: ObservableObject {
             // the decoder corrupts LPC predictor warm-up and produces an audible
             // click on the first frame of the next utterance.
             playQueues[Int32(senderSession)] = nil
+            jitterBuffers[Int32(senderSession)]?.reset()
             return
         }
         guard opusLen > 0, pos + opusLen <= payload.count else { return }
         let opusBytes = payload.subdata(in: pos..<(pos + opusLen))
         markUserSpeaking(Int32(senderSession))
-        decodeAndPlay(opusBytes, sender: Int32(senderSession))
+        decodeAndPlay(opusBytes, sender: Int32(senderSession),
+                       sequence: UInt32(truncatingIfNeeded: sequence))
     }
 
     private func parseProtobufUDPAudio(_ payload: Data) {
@@ -723,11 +764,13 @@ class RealMumbleClient: ObservableObject {
         guard payload.count > 1 else { return }
         let protoData = payload.subdata(in: 1..<payload.count)
         var senderSession: UInt32 = 0
+        var frameNumber: UInt32 = 0
         var opusData: Data? = nil
         var isTerminator = false
         for f in decodeProto(protoData) {
             switch f.field {
             case 3: if case .varint(let v) = f.val { senderSession = UInt32(v) }
+            case 4: if case .varint(let v) = f.val { frameNumber = UInt32(truncatingIfNeeded: v) }
             case 5: if case .bytes(let d)  = f.val { opusData = d }
             case 8: if case .varint(let v) = f.val { isTerminator = v != 0 }
             default: break
@@ -738,11 +781,12 @@ class RealMumbleClient: ObservableObject {
             // the decoder corrupts LPC predictor warm-up and produces an audible
             // click on the first frame of the next utterance.
             playQueues[Int32(senderSession)] = nil
+            jitterBuffers[Int32(senderSession)]?.reset()
             return
         }
         guard let opusBytes = opusData, !opusBytes.isEmpty else { return }
         markUserSpeaking(Int32(senderSession))
-        decodeAndPlay(opusBytes, sender: Int32(senderSession))
+        decodeAndPlay(opusBytes, sender: Int32(senderSession), sequence: frameNumber)
     }
 
     /// Mark a remote user as speaking and schedule a timer to clear the state.
@@ -765,32 +809,32 @@ class RealMumbleClient: ObservableObject {
         }
     }
 
-    private func decodeAndPlay(_ opusBytes: Data, sender: Int32) {
+    private func decodeAndPlay(_ opusBytes: Data, sender: Int32, sequence: UInt32 = 0) {
         guard !isDeafened else {
             if udpAudioPacketCount < 5 { print("[Audio] Skipped decode: deafened") }
             return
         }
-        // CoreAudio path: decode → push mono Float32 PCM into the output ring buffer.
+        // CoreAudio path: route through the per-sender JitterBuffer which owns
+        // the Opus decoder, handles FEC + PLC, and emits frames through
+        // `enqueuePlayback`.
         if useCoreAudioIO {
             guard let io = coreAudioIO, io.isRunning else {
                 if udpAudioPacketCount < 5 { print("[Audio] Skipped decode: coreAudioIO not running") }
                 return
             }
-            let decoder: Opus.Decoder
-            if let existing = opusDecoders[sender] {
-                decoder = existing
+            let jb: JitterBuffer
+            if let existing = jitterBuffers[sender] {
+                jb = existing
             } else {
-                guard let fresh = try? Opus.Decoder(format: opusFormat) else { return }
-                opusDecoders[sender] = fresh
-                decoder = fresh
+                guard let dec = try? Opus.Decoder(format: opusFormat) else { return }
+                let fresh = JitterBuffer(decoder: dec)
+                fresh.onFrame = { [weak io] ptr, n in
+                    io?.enqueuePlayback(ptr, count: n, sender: sender)
+                }
+                jitterBuffers[sender] = fresh
+                jb = fresh
             }
-            do {
-                let pcm = try decoder.decode(opusBytes)
-                guard let ch = pcm.floatChannelData?[0], pcm.frameLength > 0 else { return }
-                io.enqueuePlayback(ch, count: Int(pcm.frameLength))
-            } catch {
-                print("[Audio] Decode error: \(error)")
-            }
+            jb.push(seq: sequence, opus: opusBytes)
             return
         }
         guard let player = playerNode,
@@ -997,6 +1041,65 @@ class RealMumbleClient: ObservableObject {
         // 15-second interval matches the Rust implementation default.
         pingTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.sendPing() }
+        }
+        startLossAdaptTimer()
+    }
+
+    /// Phase 3: every 5 s, sample inbound packet-loss across all per-sender
+    /// jitter buffers and feed it back to the local Opus encoder. We can't see
+    /// the *actual* outbound loss the server is experiencing on our packets
+    /// (Mumble doesn't report it), so we use ingress loss as a proxy — it
+    /// correlates well in practice on symmetric Wi-Fi / cellular paths.
+    private func startLossAdaptTimer() {
+        lossAdaptTimer?.invalidate()
+        lossAdaptTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.adaptToObservedLoss() }
+        }
+    }
+
+    private func adaptToObservedLoss() {
+        var played = 0, fec = 0, plc = 0
+        var maxJitterMs: Double = 0
+        for jb in jitterBuffers.values {
+            let s = jb.snapshotAndReset()
+            played += s.played; fec += s.fec; plc += s.plc
+            if jb.targetDepthMs > maxJitterMs { maxJitterMs = jb.targetDepthMs }
+        }
+        let total = played + fec + plc
+        guard total > 0 else {
+            observedInboundLossPercent = 0
+            currentJitterDepthMs = Int(maxJitterMs)
+            return
+        }
+        // Loss = anything we couldn't play directly. FEC successes are still a
+        // signal of transient loss, but at half weight (audio quality is fine).
+        let lossUnits = Double(plc) + 0.5 * Double(fec)
+        let lossPct = Int((lossUnits / Double(total)) * 100.0)
+        let clampedLoss = max(0, min(40, lossPct))
+        observedInboundLossPercent = clampedLoss
+        currentJitterDepthMs = Int(maxJitterMs)
+
+        // Bitrate ladder. The user's `opusBitrate` setting is the BASELINE
+        // (used at low loss). We only step DOWN from there as loss climbs,
+        // so picking "Crisp" actually means "crisp" instead of being capped
+        // at 48k by an arbitrary floor.
+        let baseline = opusBitrate
+        let target: Int
+        switch clampedLoss {
+        case 0...2:   target = baseline
+        case 3...8:   target = max(28_000, baseline * 7 / 10)   // ~70%
+        case 9...20:  target = max(20_000, baseline / 2)         // ~50%
+        default:      target = max(16_000, baseline * 3 / 10)    // ~30%
+        }
+
+        if let enc = opusEncoder {
+            do {
+                try enc.setPacketLossPercentage(Int32(clampedLoss))
+                try enc.setBitrate(Int32(target))
+                currentEncoderBitrate = target
+            } catch {
+                print("[Audio] Bitrate adapt failed: \(error)")
+            }
         }
     }
 
@@ -1207,6 +1310,8 @@ class RealMumbleClient: ObservableObject {
         playerNode     = nil
         opusEncoder    = nil
         opusDecoders   = [:]
+        jitterBuffers.values.forEach { $0.stop() }
+        jitterBuffers  = [:]
         playQueues     = [:]
         opusConverter  = nil
         pcmAccumulator = []
@@ -1219,6 +1324,8 @@ class RealMumbleClient: ObservableObject {
             coreAudioIO = nil
             opusEncoder = nil
             opusDecoders = [:]
+            jitterBuffers.values.forEach { $0.stop() }
+            jitterBuffers = [:]
             pcmAccumulator = []
             silenceHoldCount = 0
             print("[Audio] CoreAudioIO stopped")
@@ -1254,15 +1361,28 @@ class RealMumbleClient: ObservableObject {
             do {
                 try encoder.setSignal(.voice)
                 try encoder.setBitrate(Int32(opusBitrate))
-                try encoder.setComplexity(opusLowDelay ? 5 : 8)
+                // Apple Silicon eats max-complexity Opus encoding for breakfast
+                // (≪ 1% of one core at 20 ms frames). Pin to 10 in normal mode;
+                // restricted-low-delay caps at 5 to fit the tighter budget.
+                try encoder.setComplexity(opusLowDelay ? 5 : 10)
                 try encoder.setVBR(true)
                 try encoder.setInbandFEC(true)
+                // 10% is a sane default; phase 3 will drive this from observed
+                // loss. Ranges 0…40 are useful in practice.
                 try encoder.setPacketLossPercentage(10)
+                // Tells Opus the source is effectively 16-bit clean — it skips
+                // bit-allocation for sub-LSB noise that doesn't exist after our
+                // limiter and AGC run upstream.
+                try encoder.setLSBDepth(16)
+                // DTX off: with our local VAD already gating transmission, DTX
+                // would just add a second layer of decisions that occasionally
+                // disagree and produce comfort-noise burps.
+                try encoder.setDTX(false)
             } catch {
                 print("[Audio] Opus control warning: \(error)")
             }
             opusEncoder = encoder
-            print("[Audio] (CoreAudioIO) Opus encoder ready (frame=\(opusFrameMs)ms / \(opusFrameSize) samples, bitrate=\(opusBitrate))")
+            print("[Audio] (CoreAudioIO) Opus encoder ready (frame=\(opusFrameMs)ms / \(opusFrameSize) samples, bitrate=\(opusBitrate), complexity=\(opusLowDelay ? 5 : 10), FEC=on, LSB=16)")
         } catch {
             print("[Audio] (CoreAudioIO) Failed to create Opus encoder: \(error)"); return
         }
@@ -1270,15 +1390,34 @@ class RealMumbleClient: ObservableObject {
         let io = CoreAudioIO()
         io.inputDeviceUID  = inputDeviceUID
         io.outputDeviceUID = outputDeviceUID
+        io.voiceProcessingMode = voiceProcessingMode
+        io.enableAGC = enableAGC
         io.output.gain     = isDeafened ? 0.0 : 1.0
         io.input.inputGain = max(0, min(8, inputGain))
 
-        // Realtime input callback: copy samples out and dispatch to MainActor
-        // for protobuf/Opus processing on the existing path.
+        // Build the pre-Opus DSP chain. Order matters:
+        //   mic → HPF (kill rumble) → limiter (prevent clipping into encoder)
+        // VPIO already handles AGC + NS + AEC inside the AU itself, so we
+        // don't add a second NS/AGC stage in software — that's wasted CPU and
+        // can fight Apple's tuning.
+        let hpf = BiquadFilter(format: .mumble,
+                               coeffs: BiquadFilter.highPass(cutoffHz: 80,
+                                                             sampleRate: 48_000,
+                                                             Q: 0.707))
+        let limiter = SoftLimiter(format: .mumble, ceilingDB: -1.0)
+        self.inputHighPass = hpf
+        self.inputLimiter  = limiter
+
+        // Realtime input callback: copy samples out, run DSP in place on the
+        // copy (we own it), then dispatch to MainActor for VAD + Opus.
         io.input.onSamples = { [weak self] ptr, n in
-            guard n > 0 else { return }
-            let buf = UnsafeBufferPointer(start: ptr, count: n)
-            let samples = Array(buf)
+            guard n > 0, let self else { return }
+            var samples = [Float](repeating: 0, count: n)
+            samples.withUnsafeMutableBufferPointer { buf in
+                buf.baseAddress!.update(from: ptr, count: n)
+                hpf.applyInPlace(buf.baseAddress!, count: n)
+                limiter.applyInPlace(buf.baseAddress!, count: n)
+            }
             Task { @MainActor [weak self] in
                 self?.processSamples(samples)
             }

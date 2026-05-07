@@ -114,7 +114,39 @@ struct SettingsView: View {
                         .pickerStyle(.segmented)
                         .frame(width: 220)
                     }
+                    LabeledContent("Voice Processing") {
+                        Picker("", selection: $audioSettings.voiceProcessing) {
+                            ForEach(VoiceProcessingChoice.allCases) { c in
+                                Text(c.label).tag(c)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 280)
+                    }
+                    .help("Routes the mic through Apple's VoiceProcessingIO unit (AEC + NS + AGC). On AirPods Pro 2 / AirPods 4 / AirPods Max (USB-C) running macOS 14+, enabling this also unlocks Apple's high-quality 48 kHz duplex voice mode — your music keeps sounding good even while the mic is open. Auto chooses ON for built-in mic and Bluetooth headsets, OFF for studio USB interfaces and aggregate devices.")
                 }
+
+                Section("Connection Quality") {
+                    LabeledContent("Status",
+                                   value: viewModel.isConnected ? "Connected" : "Disconnected")
+                    if viewModel.isConnected {
+                        LabeledContent("Encoder Bitrate",
+                                       value: viewModel.currentEncoderBitrate > 0
+                                            ? "\(viewModel.currentEncoderBitrate / 1000) kbps"
+                                            : "—")
+                        LabeledContent("Inbound Loss",
+                                       value: "\(viewModel.observedInboundLossPercent) %")
+                        LabeledContent("Jitter Buffer",
+                                       value: viewModel.currentJitterDepthMs > 0
+                                            ? "\(viewModel.currentJitterDepthMs) ms"
+                                            : "—")
+                    } else {
+                        Text("Live values appear once you join a server.")
+                            .foregroundStyle(.secondary)
+                            .font(.callout)
+                    }
+                }
+                .help("Shows the live state of the bidirectional voice path: how aggressively the encoder is compressing, how lossy the network is, and how much jitter the playback buffer is currently absorbing.")
 
                 Section("About") {
                     LabeledContent("Version", value: "1.0.0")

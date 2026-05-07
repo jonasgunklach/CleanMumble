@@ -33,6 +33,16 @@ class MumbleViewModel: ObservableObject {
     /// Smoothed RMS of the playback output (what other speakers sound like).
     @Published var outputLevelRMS: Float = 0
     @Published var outputLevelPeak: Float = 0
+    /// Phase 4: connection-quality stats mirrored from RealMumbleClient.
+    @Published var observedInboundLossPercent: Int = 0
+    @Published var currentEncoderBitrate: Int = 0
+    @Published var currentJitterDepthMs: Int = 0
+    /// Negotiated voice mode (e.g. "AirPods Hi-Q"); nil when not connected
+    /// or when the input device couldn't be queried.
+    @Published var voiceQualityBadge: String? = nil
+    /// Whether the VPIO Audio Unit is actually active right now (resolved
+    /// after the .auto choice has been applied to the running device).
+    @Published var voiceProcessingActive: Bool = false
     @Published var userPreferences: UserPreferences = UserPreferences()
     @Published var chatMessages: [ChatMessage] = []
     
@@ -221,7 +231,33 @@ class MumbleViewModel: ObservableObject {
                 self?.isDeafened = deafened
             }
             .store(in: &cancellables)
+
+        realMumbleClient?.$observedInboundLossPercent
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$observedInboundLossPercent)
+        realMumbleClient?.$currentEncoderBitrate
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$currentEncoderBitrate)
+        realMumbleClient?.$currentJitterDepthMs
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$currentJitterDepthMs)
         
+        // Push current audio preferences to the client BEFORE connect, so the
+        // engine that's spun up on ServerSync uses the user's chosen devices,
+        // VPIO mode, Opus quality, and VAD threshold from the very first start.
+        if let client = realMumbleClient {
+            let s = userPreferences.audioSettings
+            client.inputDeviceUID  = s.inputDevice
+            client.outputDeviceUID = s.outputDevice
+            client.opusBitrate  = s.quality.bitrate
+            client.opusFrameMs  = s.quality.frameMs
+            client.opusLowDelay = s.quality.lowDelay
+            client.voiceProcessingMode = s.voiceProcessing.toCAInputMode
+            client.enableAGC = s.enableAutomaticGainControl
+            client.vadThreshold = 0.001 + Float(s.voiceActivityThreshold) * 0.049
+            client.inputGain = s.inputVolume
+        }
+
         // Start connection
         realMumbleClient?.connect(to: server.host, port: UInt16(server.port), username: server.username, password: server.password)
         startLevelMeterTimer()
@@ -305,6 +341,8 @@ class MumbleViewModel: ObservableObject {
             client.opusBitrate  = settings.quality.bitrate
             client.opusFrameMs  = settings.quality.frameMs
             client.opusLowDelay = settings.quality.lowDelay
+            client.voiceProcessingMode = settings.voiceProcessing.toCAInputMode
+            client.enableAGC = settings.enableAutomaticGainControl
             // Map slider 0…1 → RMS 0.001 (very sensitive) … 0.05 (loud only).
             // Mumble-style voice activation: anything below the threshold is
             // treated as silence and not transmitted.
