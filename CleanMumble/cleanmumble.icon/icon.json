@@ -7,6 +7,8 @@
       "blur-material" : null,
       "layers" : [
         {
+          "fill" : "automatic",
+          "glass" : true,
           "image-name" : "5ec574ca-380b-4cb2-9df6-7853521488cb 2.png",
           "name" : "5ec574ca-380b-4cb2-9df6-7853521488cb 2",
           "opacity" : 1,

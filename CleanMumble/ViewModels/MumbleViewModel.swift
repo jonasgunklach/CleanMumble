@@ -45,6 +45,9 @@ class MumbleViewModel: ObservableObject {
     @Published var voiceProcessingActive: Bool = false
     @Published var userPreferences: UserPreferences = UserPreferences()
     @Published var chatMessages: [ChatMessage] = []
+    /// Set when the server announces a Fancy Mumble REST API URL in ServerConfig.
+    /// Non-nil means link previews, extended reactions, etc. are available.
+    @Published var fancyRestApiURL: String?
     
     // MARK: - Computed Properties
     var usersInCurrentChannel: [UserInfo] {
@@ -217,6 +220,11 @@ class MumbleViewModel: ObservableObject {
                 self?.saveChatMessages()
             }
             .store(in: &cancellables)
+
+        realMumbleClient?.$fancyRestApiURL
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] url in self?.fancyRestApiURL = url }
+            .store(in: &cancellables)
         
         realMumbleClient?.$isMuted
             .receive(on: DispatchQueue.main)
@@ -275,6 +283,7 @@ class MumbleViewModel: ObservableObject {
         users = []
         currentChannel = nil
         chatMessages = []
+        fancyRestApiURL = nil
         stopAudioEngine()
         #if os(iOS)
         // Hand the audio focus back to whatever app was playing before us.
@@ -291,6 +300,11 @@ class MumbleViewModel: ObservableObject {
     func sendTextMessage(_ message: String) {
         // Send to real Mumble client
         realMumbleClient?.sendTextMessage(message, to: UInt32(currentChannel?.channelId ?? 0))
+    }
+
+    /// Send an image to the current channel as a base64-encoded inline message.
+    func sendImageMessage(_ imageData: Data, mimeType: String = "image/jpeg") {
+        realMumbleClient?.sendImageMessage(imageData, mimeType: mimeType)
     }
     
     // MARK: - Audio Controls

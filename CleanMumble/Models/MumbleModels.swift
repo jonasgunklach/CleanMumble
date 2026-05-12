@@ -250,6 +250,23 @@ struct ChannelInfo: Identifiable, Codable {
     }
 }
 
+// MARK: - Link Preview
+/// Rich link-preview embed delivered by the Fancy Mumble server (wire type 133).
+struct LinkPreviewData: Codable {
+    var title: String?
+    var description: String?
+    var siteName: String?
+    /// Server-fetched downscaled thumbnail bytes (typically JPEG).
+    var thumbnailData: Data?
+    var thumbnailMime: String?
+    /// Canonical URL of the resource.
+    var url: String
+    /// Embed type from the server: "video", "image", "article", "link", etc.
+    var previewType: String?
+    /// Dominant accent colour packed as 0xRRGGBB (0 = none).
+    var accentColor: Int32?
+}
+
 // MARK: - User Info
 struct UserInfo: Identifiable, Codable {
     let id = UUID()

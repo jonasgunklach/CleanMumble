@@ -178,6 +178,10 @@ class RealMumbleClient: ObservableObject {
     @Published var audioInputLevel: Float = 0.0
     @Published var audioOutputLevel: Float = 0.0
     @Published var isSpeaking: Bool = false
+    /// Public base URL of the Fancy Mumble REST API, received in ServerConfig field 9.
+    /// Non-nil means the server is a Fancy Mumble instance and supports link previews,
+    /// file uploads, etc.
+    @Published var fancyRestApiURL: String?
 
     // MARK: Server capabilities (set from Version message)
     /// `true` once the server has announced version ≥ 1.5; drives audio format choice.
@@ -484,6 +488,7 @@ class RealMumbleClient: ObservableObject {
         case 15: onCryptSetup(payload)
         case 21: break   // CodecVersion – no action needed
         case 24: onServerConfig(payload)
+        case 133: onLinkPreviewResponse(payload)
         default: break
         }
     }
@@ -692,14 +697,26 @@ class RealMumbleClient: ObservableObject {
             }
         }
         guard !text.isEmpty else { return }
-        // Mumble sends message bodies as HTML; strip tags for plain-text display.
-        let display = text.strippingHTML
-        guard !display.isEmpty else { return }
+
+        // Extract any inline <img> from the HTML and strip tags for plain text.
+        let (display, imageURL, imageData) = extractImageFromHTML(text)
+        guard !display.isEmpty || imageURL != nil || imageData != nil else { return }
+
         let sender = actor
             .flatMap { id in users.first { $0.userId == Int32(id) }?.name }
             ?? "Server"
-        chatMessages.append(ChatMessage(id: UUID(), content: display, sender: sender,
-                                        timestamp: Date(), type: .text))
+        let msgId = UUID()
+        chatMessages.append(ChatMessage(id: msgId, content: display, sender: sender,
+                                        timestamp: Date(), type: .text,
+                                        imageURL: imageURL, imageData: imageData))
+
+        // If connected to a Fancy server, request link previews for any URLs in the text.
+        if fancyRestApiURL != nil, !display.isEmpty {
+            let urls = extractURLs(from: display)
+            if !urls.isEmpty {
+                sendLinkPreviewRequest(urls: urls, requestId: msgId.uuidString)
+            }
+        }
     }
 
     private func onCryptSetup(_ payload: Data) {
@@ -707,6 +724,123 @@ class RealMumbleClient: ObservableObject {
         // We tunnel audio over TCP (UDPTunnel type 1) to avoid needing OCB2.
         print("[Mumble] CryptSetup received (audio via TCP tunnel)")
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // MARK: - Fancy Mumble: link previews & image helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Handle FancyLinkPreviewResponse (wire type 133).
+    private func onLinkPreviewResponse(_ payload: Data) {
+        var requestId = ""
+        var embedPayloads: [Data] = []
+        for f in decodeProto(payload) {
+            switch f.field {
+            case 1: if case .bytes(let d) = f.val { requestId = str(d) }
+            case 2: if case .bytes(let d) = f.val { embedPayloads.append(d) }
+            default: break
+            }
+        }
+        guard !requestId.isEmpty else { return }
+
+        var previews: [LinkPreviewData] = []
+        for embedData in embedPayloads {
+            var url = ""; var type_ = ""; var title = ""; var desc = ""; var siteName = ""
+            var color: Int32 = 0
+            var thumbData: Data? = nil; var thumbMime = ""
+
+            for f in decodeProto(embedData) {
+                switch f.field {
+                case 1: if case .bytes(let d) = f.val { url      = str(d) }
+                case 2: if case .bytes(let d) = f.val { type_    = str(d) }
+                case 3: if case .bytes(let d) = f.val { title    = str(d) }
+                case 4: if case .bytes(let d) = f.val { desc     = str(d) }
+                case 5: if case .varint(let v) = f.val { color   = Int32(bitPattern: UInt32(v & 0xFFFFFFFF)) }
+                case 6: if case .bytes(let d) = f.val { siteName = str(d) }
+                case 7: // thumbnail Media sub-message
+                    if case .bytes(let d) = f.val {
+                        for mf in decodeProto(d) {
+                            switch mf.field {
+                            case 4: if case .bytes(let bd) = mf.val { thumbData = bd }
+                            case 5: if case .bytes(let md) = mf.val { thumbMime = str(md) }
+                            default: break
+                            }
+                        }
+                    }
+                default: break
+                }
+            }
+            guard !url.isEmpty else { continue }
+            previews.append(LinkPreviewData(
+                title:         title.isEmpty    ? nil : title,
+                description:   desc.isEmpty     ? nil : desc,
+                siteName:      siteName.isEmpty ? nil : siteName,
+                thumbnailData: thumbData,
+                thumbnailMime: thumbMime.isEmpty ? nil : thumbMime,
+                url:           url,
+                previewType:   type_.isEmpty    ? nil : type_,
+                accentColor:   color != 0       ? color : nil
+            ))
+        }
+
+        // Attach previews to the matching message.
+        if let idx = chatMessages.firstIndex(where: { $0.id.uuidString == requestId }) {
+            chatMessages[idx].linkPreviews = previews.isEmpty ? nil : previews
+        }
+    }
+
+    /// Send FancyLinkPreviewRequest (wire type 132) for the given URLs.
+    private func sendLinkPreviewRequest(urls: [String], requestId: String) {
+        guard !urls.isEmpty else { return }
+        var p = Data()
+        for url in urls { p.pbString(field: 1, value: url) }
+        p.pbString(field: 2, value: requestId)
+        sendFrame(type: 132, payload: p)
+    }
+
+    /// Extract URLs from plain text using NSDataDetector.
+    private func extractURLs(from text: String) -> [String] {
+        guard let detector = try? NSDataDetector(
+            types: NSTextCheckingResult.CheckingType.link.rawValue) else { return [] }
+        let range = NSRange(text.startIndex..., in: text)
+        return detector.matches(in: text, range: range)
+            .compactMap { $0.url?.absoluteString }
+    }
+
+    /// Parse the first `<img>` tag from an HTML string and return the plain
+    /// text (tags stripped), plus any detected image URL or inline data bytes.
+    private func extractImageFromHTML(_ html: String) -> (text: String, imageURL: String?, imageData: Data?) {
+        var imageURL: String? = nil
+        var imageData: Data? = nil
+        var processedHTML = html
+
+        // Pattern matches <img ...src="VALUE"...> (case-insensitive, single-line).
+        let pattern = #"<img[^>]+\bsrc="([^"]*)"[^>]*/?\s*>"#
+        if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators]),
+           let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+           let srcNSRange = Range(match.range(at: 1), in: html) {
+
+            let src = String(html[srcNSRange])
+            // Remove the <img> tag from the HTML before stripping remaining tags.
+            if let tagRange = Range(match.range, in: html) {
+                processedHTML = html.replacingCharacters(in: tagRange, with: "")
+            }
+
+            if src.hasPrefix("data:") {
+                // Inline data URI — decode the base64 payload.
+                if let commaIdx = src.firstIndex(of: ",") {
+                    let b64 = String(src[src.index(after: commaIdx)...])
+                    imageData = Data(base64Encoded: b64, options: .ignoreUnknownCharacters)
+                }
+            } else if src.hasPrefix("http://") || src.hasPrefix("https://") {
+                imageURL = src
+            }
+        }
+
+        let display = processedHTML.strippingHTML
+        return (display, imageURL, imageData)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
 
     /// Handle incoming UDPTunnel (type 1) audio packets from the server.
     /// Mumble audio packet inside UDPTunnel (server → client):
@@ -897,9 +1031,22 @@ class RealMumbleClient: ObservableObject {
 
     private func onServerConfig(_ payload: Data) {
         for f in decodeProto(payload) {
-            if f.field == 2, case .bytes(let d) = f.val {
-                let txt = str(d)
-                if !txt.isEmpty { print("[Mumble] ServerConfig: \(txt.prefix(120))") }
+            switch f.field {
+            case 2:
+                if case .bytes(let d) = f.val {
+                    let txt = str(d)
+                    if !txt.isEmpty { print("[Mumble] ServerConfig welcome: \(txt.prefix(120))") }
+                }
+            case 9:
+                // fancy_rest_api_url — non-empty means this is a Fancy Mumble server.
+                if case .bytes(let d) = f.val {
+                    let apiURL = str(d)
+                    if !apiURL.isEmpty {
+                        fancyRestApiURL = apiURL
+                        print("[Mumble] Fancy server detected — REST API: \(apiURL)")
+                    }
+                }
+            default: break
             }
         }
     }
@@ -957,8 +1104,37 @@ class RealMumbleClient: ObservableObject {
 
         // Optimistic local echo — show the raw message text, not the HTML.
         let me = users.first { $0.userId == Int32(sessionId) }?.name ?? username
-        chatMessages.append(ChatMessage(id: UUID(), content: message, sender: me,
+        let msgId = UUID()
+        chatMessages.append(ChatMessage(id: msgId, content: message, sender: me,
                                         timestamp: Date(), type: .text))
+
+        // Request link previews on Fancy servers.
+        if fancyRestApiURL != nil {
+            let urls = extractURLs(from: message)
+            if !urls.isEmpty {
+                sendLinkPreviewRequest(urls: urls, requestId: msgId.uuidString)
+            }
+        }
+    }
+
+    /// Send an image as a base64-encoded inline `<img>` HTML message.
+    /// Works on any Mumble server that allows HTML and image messages.
+    /// The caller should compress the image to stay under the server's
+    /// `imagemessagelength` limit (default 1 MB base64 ≈ 750 KB raw).
+    func sendImageMessage(_ imageData: Data, mimeType: String = "image/jpeg") {
+        let base64 = imageData.base64EncodedString()
+        let html = "<img src=\"data:\(mimeType);base64,\(base64)\" />"
+        let target = UInt32(currentChannel?.channelId ?? 0)
+        var p = Data()
+        p.pbUInt32(field: 3, value: target)
+        p.pbString(field: 5, value: html)
+        sendFrame(type: 11, payload: p)
+
+        // Optimistic local echo — show the image immediately.
+        let me = users.first { $0.userId == Int32(sessionId) }?.name ?? username
+        chatMessages.append(ChatMessage(id: UUID(), content: "", sender: me,
+                                        timestamp: Date(), type: .text,
+                                        imageData: imageData))
     }
 
     // MARK: - Mute / Deafen

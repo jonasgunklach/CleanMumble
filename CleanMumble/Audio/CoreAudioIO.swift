@@ -33,8 +33,15 @@ private let kBytesPerSample: UInt32 = 4 // Float32
 /// Window after a successful `start()` during which AU property-change
 /// notifications are ignored. The system commonly republishes the stream
 /// format right after the AU starts, which would otherwise create an
-/// infinite restart loop.
-private let kHotswapSuppressionSeconds: CFAbsoluteTime = 1.0
+/// infinite restart loop. AirPods Pro in particular fires a burst of
+/// notifications during SCO renegotiation; 2.5 s covers the full settle time.
+private let kHotswapSuppressionSeconds: CFAbsoluteTime = 2.5
+
+/// How long to wait after the LAST property-change notification before
+/// actually performing the restart. Collapsing a burst of AirPods
+/// notifications into a single restart avoids the double-restart pattern
+/// observed when Bluetooth renegotiates its codec.
+private let kHotswapDebounceSeconds: TimeInterval = 0.3
 
 /// Two formats are considered equal for hot-swap purposes when these key
 /// fields match. Avoids restarting on cosmetic flag changes.
@@ -258,6 +265,9 @@ final class CoreAudioInput {
     /// AudioConverter that resamples device-rate mono Float32 → 48 kHz mono
     /// Float32. nil when no rate conversion is necessary.
     private var resampler: AudioConverterRef?
+    /// Pending debounced restart — cancelled and rescheduled by each
+    /// hotswap notification so rapid bursts collapse into one restart.
+    private var pendingHotswap: DispatchWorkItem?
     /// Scratch buffer for the resampled output (48 kHz mono Float32).
     private var resampledScratch: UnsafeMutablePointer<Float>?
     private var resampledScratchFrames: Int = 0
@@ -672,8 +682,8 @@ final class CoreAudioInput {
         print("[CAInput] VPIO sub-props applied: AGC=\(enableAGC) bypassNS/AEC=\(bypassNoiseSuppressionAndAEC)")
     }
 
-    /// Called from a property listener (off the audio thread). We bounce to
-    /// main and restart the unit cleanly.
+    /// Called from a property listener (off the audio thread). We debounce
+    /// and bounce to main before restarting the unit cleanly.
     fileprivate func handleHotswap(reason: String) {
         // Suppress restart storms during the immediate post-start window.
         let now = CFAbsoluteTimeGetCurrent()
@@ -693,11 +703,21 @@ final class CoreAudioInput {
                 return
             }
         }
+        // Debounce: cancel any previous pending restart and re-arm the timer.
+        // Rapid notification bursts (AirPods SCO renegotiation) collapse into
+        // a single restart fired after the last notification settles.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            print("[CAInput] Restart requested: \(reason)")
-            self.start()
-            self.onRestart?()
+            self.pendingHotswap?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                print("[CAInput] Restart triggered: \(reason)")
+                self.pendingHotswap = nil
+                self.start()
+                self.onRestart?()
+            }
+            self.pendingHotswap = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + kHotswapDebounceSeconds, execute: work)
         }
     }
 
@@ -869,6 +889,8 @@ final class CoreAudioOutput {
     /// See `CoreAudioInput.lastStartedAt`.
     private var lastStartedAt: CFAbsoluteTime = 0
     private var lastFormat = AudioStreamBasicDescription()
+    /// Pending debounced restart — see CoreAudioInput.pendingHotswap.
+    private var pendingHotswap: DispatchWorkItem?
 
     /// Output device UID ("Default" / "" → system default).
     var deviceUID: String = "Default"
@@ -1031,8 +1053,13 @@ final class CoreAudioOutput {
         self.lastStartedAt = CFAbsoluteTimeGetCurrent()
         var postFmt = AudioStreamBasicDescription()
         var postSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        // Track the HARDWARE (output-scope) format so handleHotswap can detect
+        // when the device sample rate or channel count changes (e.g. a game
+        // forcing the system to 44.1 kHz). The input-scope format is always our
+        // own fixed 48 kHz value and never changes, so checking it made
+        // formatsMatch() always return true and the AU never restarted.
         if AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
-                                kAudioUnitScope_Input, 0,
+                                kAudioUnitScope_Output, 0,
                                 &postFmt, &postSize) == noErr {
             self.lastFormat = postFmt
         }
@@ -1089,18 +1116,31 @@ final class CoreAudioOutput {
         if let unit = au {
             var f = AudioStreamBasicDescription()
             var s = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+            // Compare OUTPUT scope (hardware format) against what we saw at
+            // start time. When a game changes the device sample rate or
+            // channel count the output scope changes; the input scope (our
+            // fixed 48 kHz render format) never changes, so comparing it
+            // was useless and caused the AU to never restart on game launch.
             if AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
-                                    kAudioUnitScope_Input, 0,
+                                    kAudioUnitScope_Output, 0,
                                     &f, &s) == noErr,
                formatsMatch(f, lastFormat) {
                 print("[CAOutput] Ignored hotswap (\(reason)): format unchanged")
                 return
             }
         }
+        // Debounce — same pattern as CoreAudioInput.handleHotswap.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            print("[CAOutput] Restart requested: \(reason)")
-            self.start()
+            self.pendingHotswap?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                print("[CAOutput] Restart triggered: \(reason)")
+                self.pendingHotswap = nil
+                self.start()
+            }
+            self.pendingHotswap = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + kHotswapDebounceSeconds, execute: work)
         }
     }
 
