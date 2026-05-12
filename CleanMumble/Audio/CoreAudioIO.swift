@@ -586,11 +586,15 @@ final class CoreAudioInput {
 
         self.isRunning = true
         self.lastStartedAt = CFAbsoluteTimeGetCurrent()
-        // Cache the post-start format so the listener can dedupe no-op events.
+        // Cache the post-start HARDWARE format (Input scope, bus 1) so the
+        // hotswap listener can correctly detect device sample-rate changes.
+        // Using Output scope here would always return the app-set format
+        // (24 kHz for AirPods) and the dedupe would never fire on a LoL
+        // sample-rate negotiation.
         var postFmt = AudioStreamBasicDescription()
         var postSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
         if AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
-                                kAudioUnitScope_Output, 1,
+                                kAudioUnitScope_Input, 1,
                                 &postFmt, &postSize) == noErr {
             self.lastFormat = postFmt
         }
@@ -691,12 +695,17 @@ final class CoreAudioInput {
             print("[CAInput] Ignored hotswap (\(reason)) within suppression window")
             return
         }
-        // Dedupe by reading the *current* format and comparing to lastFormat.
+        // Dedupe by reading the *current* HARDWARE format (Input scope, bus 1)
+        // and comparing to lastFormat.  The Output scope (bus 1) reflects the
+        // app-set format (e.g. 24 kHz mono) and never changes, so comparing
+        // it was useless — a game forcing the device sample rate changes only
+        // the hardware / Input scope, causing the dedupe to always say
+        // "unchanged" and skip the restart.
         if let unit = au {
             var f = AudioStreamBasicDescription()
             var s = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
             if AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
-                                    kAudioUnitScope_Output, 1,
+                                    kAudioUnitScope_Input, 1,
                                     &f, &s) == noErr,
                formatsMatch(f, lastFormat) {
                 print("[CAInput] Ignored hotswap (\(reason)): format unchanged")
@@ -891,6 +900,10 @@ final class CoreAudioOutput {
     private var lastFormat = AudioStreamBasicDescription()
     /// Pending debounced restart — see CoreAudioInput.pendingHotswap.
     private var pendingHotswap: DispatchWorkItem?
+    /// Called on the main queue after a hotswap-triggered restart completes.
+    /// The CoreAudioIO facade uses this to co-restart the input when the
+    /// output and input share the same Bluetooth device.
+    var onRestart: (() -> Void)?
 
     /// Output device UID ("Default" / "" → system default).
     var deviceUID: String = "Default"
@@ -1138,6 +1151,7 @@ final class CoreAudioOutput {
                 print("[CAOutput] Restart triggered: \(reason)")
                 self.pendingHotswap = nil
                 self.start()
+                self.onRestart?()
             }
             self.pendingHotswap = work
             DispatchQueue.main.asyncAfter(deadline: .now() + kHotswapDebounceSeconds, execute: work)
@@ -1271,6 +1285,10 @@ private func caOutputDefaultDeviceChanged(inObjectID: AudioObjectID,
 final class CoreAudioIO {
     let input  = CoreAudioInput()
     let output = CoreAudioOutput()
+    /// Called on the main queue when either the input or the output restarts
+    /// due to a device/format change. Consumers can use this to refresh
+    /// cached format info or update UI.
+    var onRestart: (() -> Void)?
 
     var inputDeviceUID: String {
         get { input.deviceUID }
@@ -1319,6 +1337,18 @@ final class CoreAudioIO {
             return
         }
         output.start()
+        // When the output restarts due to a device format change (e.g. a game
+        // forcing a different sample rate), the same Bluetooth SCO link that
+        // feeds the input has also renegotiated its codec.  Co-restart the
+        // input so its AUHAL and software resampler reinitialise against the
+        // new hardware format — without this, the input keeps running with a
+        // stale deviceSampleRate and produces robotic/pitch-shifted audio.
+        output.onRestart = { [weak self] in
+            guard let self else { return }
+            print("[CoreAudioIO] Co-restarting input after output device change")
+            self.input.start()
+            self.onRestart?()
+        }
     }
 
     func stop() {
