@@ -948,6 +948,7 @@ final class CoreAudioOutput {
         enqueueCallsBySender[sender] = n
         os_unfair_lock_unlock(senderRingsLock)
         ring.write(samples, count: count)
+        #if DEBUG
         if isNew || n == 50 || n % 250 == 0 {
             // Compute a quick RMS of this chunk so we can verify the data is non-silent.
             var sumSq: Float = 0
@@ -955,6 +956,7 @@ final class CoreAudioOutput {
             let rms = sqrtf(sumSq / Float(max(count, 1)))
             print("[CAOutput][DIAG] enqueue sender=\(sender) call#\(n) count=\(count) rms=\(String(format: "%.4f", rms)) ringsCount=\(senderRings.count)")
         }
+        #endif
     }
 
     /// Drop the per-sender ring for a user that left the channel.
@@ -1230,9 +1232,11 @@ final class CoreAudioOutput {
         if lastRenderLogHostTime == 0 { lastRenderLogHostTime = nowHost }
         // ~2s @ 1e9 ns and timebase ≈ 1 ns/tick on Apple Silicon. We tolerate slight drift.
         if nowHost &- lastRenderLogHostTime > 2_000_000_000 {
+            #if DEBUG
             let rms = sqrtf(sumSq / Float(max(n, 1)))
             let snap = snapshotRings()
             print("[CAOutput][DIAG] render calls=\(renderCallCount) nonZero=\(renderNonZeroCount) lastPeak=\(String(format: "%.4f", peak)) lastRMS=\(String(format: "%.4f", rms)) gain=\(String(format: "%.2f", gain)) senderRings=\(snap.count)")
+            #endif
             renderCallCount = 0
             renderNonZeroCount = 0
             lastRenderLogHostTime = nowHost

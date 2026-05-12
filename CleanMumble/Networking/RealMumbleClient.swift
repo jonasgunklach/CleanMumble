@@ -1324,7 +1324,7 @@ class RealMumbleClient: ObservableObject {
             do {
                 try encoder.setSignal(.voice)
                 try encoder.setBitrate(Int32(opusBitrate))
-                try encoder.setComplexity(opusLowDelay ? 5 : 8)
+                try encoder.setComplexity(5) // matches Mumble default; inaudible difference at voice bitrates
                 try encoder.setVBR(true)
                 try encoder.setInbandFEC(true)
                 try encoder.setPacketLossPercentage(10)
@@ -1537,10 +1537,10 @@ class RealMumbleClient: ObservableObject {
             do {
                 try encoder.setSignal(.voice)
                 try encoder.setBitrate(Int32(opusBitrate))
-                // Apple Silicon eats max-complexity Opus encoding for breakfast
-                // (≪ 1% of one core at 20 ms frames). Pin to 10 in normal mode;
-                // restricted-low-delay caps at 5 to fit the tighter budget.
-                try encoder.setComplexity(opusLowDelay ? 5 : 10)
+                // Mumble's default complexity is 5 for all modes. At voice
+                // bitrates (32–96 kbps) the perceptual difference above 5 is
+                // inaudible, so there's no reason to burn extra CPU.
+                try encoder.setComplexity(5)
                 try encoder.setVBR(true)
                 try encoder.setInbandFEC(true)
                 // 10% is a sane default; phase 3 will drive this from observed
@@ -1670,6 +1670,7 @@ class RealMumbleClient: ObservableObject {
     private func processSamples(_ samples: [Float]) {
         // Diagnostic: log the first few callbacks so we know the input pipeline
         // is alive end-to-end, then drop to once-per-second.
+        #if DEBUG
         if diagFirstChunks > 0 {
             diagFirstChunks -= 1
             var sum: Double = 0
@@ -1693,6 +1694,7 @@ class RealMumbleClient: ObservableObject {
                          vadThreshold))
             diagSampleCounter = 0
         }
+        #endif
         guard !isMuted, isConnected else {
             audioInputLevel = 0
             if isSpeaking {

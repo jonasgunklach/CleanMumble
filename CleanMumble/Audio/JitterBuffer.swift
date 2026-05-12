@@ -60,6 +60,11 @@ final class JitterBuffer {
     private var jitterVAR: Double = 0           // variance estimator (ms²)
     private var firstFrameDeadline: TimeInterval?
     private var timer: DispatchSourceTimer?
+    /// True when `timer` is currently suspended to save power. The timer is
+    /// suspended whenever there's nothing to drain (no anchored playhead and
+    /// no queued packets) and resumed by `push()`. With ~7 talkers this drops
+    /// idle-time wake-ups from 700/sec to 0/sec.
+    private var timerSuspended = false
     private let queue = DispatchQueue(label: "com.cleanmumble.JitterBuffer",
                                        qos: .userInteractive)
     private var pcmScratch = [Float](repeating: 0, count: 5760) // 120 ms max
@@ -124,6 +129,11 @@ final class JitterBuffer {
                 nextSeq = seq
                 firstFrameDeadline = now + targetDepthMs / 1000.0
             }
+            // Resume the drain timer if we'd suspended it during idle.
+            if timerSuspended, let t = timer {
+                t.resume()
+                timerSuspended = false
+            }
         }
     }
 
@@ -144,6 +154,13 @@ final class JitterBuffer {
     func stop() {
         lock.withLock {
             stopped = true
+            // DispatchSourceTimer must be resumed before cancel() if it's
+            // currently suspended, otherwise the cancel handler never fires
+            // and resources leak.
+            if timerSuspended {
+                timer?.resume()
+                timerSuspended = false
+            }
             timer?.cancel()
             timer = nil
         }
@@ -166,7 +183,17 @@ final class JitterBuffer {
     private func tick() {
         // Snapshot under lock, do work outside (decoder calls can be slow-ish).
         let work: DrainAction = lock.withLock {
-            guard !stopped, let want = nextSeq else { return DrainAction.none }
+            guard !stopped else { return DrainAction.none }
+            // Idle suspend: nothing to play and nothing queued. Park the
+            // timer until the next push() arrives. With many talkers in a
+            // channel this saves hundreds of wake-ups per second when no
+            // one is speaking.
+            if nextSeq == nil && packets.isEmpty, let t = timer, !timerSuspended {
+                t.suspend()
+                timerSuspended = true
+                return DrainAction.none
+            }
+            guard let want = nextSeq else { return DrainAction.none }
             let now = Self.monotonicNow()
 
             // Initial buffering: wait until depth elapses OR enough packets queued.

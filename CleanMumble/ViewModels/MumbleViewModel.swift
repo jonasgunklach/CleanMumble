@@ -193,7 +193,9 @@ class MumbleViewModel: ObservableObject {
         realMumbleClient?.$channels
             .receive(on: DispatchQueue.main)
             .sink { [weak self] newChannels in
+                #if DEBUG
                 print("📱 ViewModel received \(newChannels.count) channels")
+                #endif
                 self?.channels = newChannels
             }
             .store(in: &cancellables)
@@ -201,7 +203,9 @@ class MumbleViewModel: ObservableObject {
         realMumbleClient?.$users
             .receive(on: DispatchQueue.main)
             .sink { [weak self] newUsers in
+                #if DEBUG
                 print("📱 ViewModel received \(newUsers.count) users")
+                #endif
                 self?.users = newUsers
             }
             .store(in: &cancellables)
