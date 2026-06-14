@@ -59,6 +59,13 @@ final class JitterBuffer {
     private var jitterEMA: Double = 0           // exponentially-smoothed jitter (ms)
     private var jitterVAR: Double = 0           // variance estimator (ms²)
     private var firstFrameDeadline: TimeInterval?
+    /// Wall-clock deadline by which the next frame must arrive before stale is
+    /// declared. Anchored to playback time (now + frameInterval after each play)
+    /// so it tracks the playback timeline rather than packet arrival time. This
+    /// prevents false stale fires when the server TCP-batches multiple frames:
+    /// the batch drains quickly, but nextFrameDueTime advances one frame per
+    /// play, giving the next batch time to arrive without triggering PLC.
+    private var nextFrameDueTime: TimeInterval = 0
     private var timer: DispatchSourceTimer?
     /// True when `timer` is currently suspended to save power. The timer is
     /// suspended whenever there's nothing to drain (no anchored playhead and
@@ -176,6 +183,7 @@ final class JitterBuffer {
                 lastArrivalHostTime = nil
                 firstFrameDeadline = nil
                 consecutivePLC = 0
+                nextFrameDueTime = 0
                 pendingTerminator = false
                 seqStep = 1; seqStepDetected = false; firstReceivedSeq = nil
                 try? decoder.resetState()
@@ -194,6 +202,7 @@ final class JitterBuffer {
             lastArrivalHostTime = nil
             firstFrameDeadline = nil
             consecutivePLC = 0
+            nextFrameDueTime = 0
             pendingTerminator = false
             seqStep = 1; seqStepDetected = false; firstReceivedSeq = nil
             try? decoder.resetState()
@@ -253,16 +262,19 @@ final class JitterBuffer {
             }
             firstFrameDeadline = nil
 
+            let frameSeconds = Double(frameSize) / sampleRate
             let action: DrainAction
             if let p = packets.removeValue(forKey: want) {
                 action = .play(p)
                 nextSeq = want &+ seqStep
                 consecutivePLC = 0
+                nextFrameDueTime = now + frameSeconds
             } else if let next = packets[want &+ seqStep] {
                 // Packet for `want` is missing, but the next expected seq is here — try FEC.
                 action = .fec(next)
                 nextSeq = want &+ seqStep
                 consecutivePLC = 0
+                nextFrameDueTime = now + frameSeconds
             } else {
                 // Neither is present yet.
                 if pendingTerminator {
@@ -271,16 +283,24 @@ final class JitterBuffer {
                     nextSeq = nil
                     firstFrameDeadline = nil
                     consecutivePLC = 0
+                    nextFrameDueTime = 0
                     pendingTerminator = false
                     seqStep = 1; seqStepDetected = false; firstReceivedSeq = nil
                     action = .resetDecoder
                 } else {
-                    // If we've waited more than one frame interval past the
-                    // expected arrival of `want`, give up and emit PLC to keep
-                    // playback continuous. Otherwise wait one more tick.
-                    let oneFrameMs = Double(frameSize) / sampleRate * 1000
-                    let stale = (lastArrivalHostTime.map { (now - $0) * 1000 } ?? .infinity) > oneFrameMs * 1.5
-                    if stale {
+                    // Stale detection anchored to playback timeline: when the server
+                    // TCP-batches frames, they drain faster than real-time but
+                    // nextFrameDueTime advances one frame per play — so we correctly
+                    // wait for the next batch rather than firing PLC immediately.
+                    // Fall back to arrival time before the first frame is played.
+                    let oneFrameMs = frameSeconds * 1000
+                    let lateMs: Double
+                    if nextFrameDueTime > 0 {
+                        lateMs = max(0, now - nextFrameDueTime) * 1000
+                    } else {
+                        lateMs = lastArrivalHostTime.map { (now - $0) * 1000 } ?? .infinity
+                    }
+                    if lateMs > oneFrameMs * 1.5 {
                         consecutivePLC &+= 1
                         if consecutivePLC > maxConsecutivePLC {
                             // Sender has gone silent without a terminator. Stop
@@ -291,9 +311,11 @@ final class JitterBuffer {
                             nextSeq = nil
                             firstFrameDeadline = nil
                             consecutivePLC = 0
+                            nextFrameDueTime = 0
                             action = .none
                         } else {
                             nextSeq = want &+ seqStep
+                            nextFrameDueTime = now + frameSeconds
                             action = .plc
                         }
                     } else {
