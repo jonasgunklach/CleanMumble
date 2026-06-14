@@ -294,13 +294,17 @@ final class JitterBuffer {
                     // wait for the next batch rather than firing PLC immediately.
                     // Fall back to arrival time before the first frame is played.
                     let oneFrameMs = frameSeconds * 1000
+                    // Adaptive threshold: scale with observed jitter so high-jitter
+                    // paths (cellular, VPN) get more headroom before PLC fires.
+                    // Fixed 1.5× (30ms for 20ms frames) was too aggressive over TCP.
+                    let staleThresholdMs = max(oneFrameMs * 2.0, targetDepthMs * 0.75)
                     let lateMs: Double
                     if nextFrameDueTime > 0 {
                         lateMs = max(0, now - nextFrameDueTime) * 1000
                     } else {
                         lateMs = lastArrivalHostTime.map { (now - $0) * 1000 } ?? .infinity
                     }
-                    if lateMs > oneFrameMs * 1.5 {
+                    if lateMs > staleThresholdMs {
                         consecutivePLC &+= 1
                         if consecutivePLC > maxConsecutivePLC {
                             // Sender has gone silent without a terminator. Stop
