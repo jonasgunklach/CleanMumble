@@ -78,6 +78,11 @@ final class JitterBuffer {
     /// thousands of silence frames into the output ring.
     private var consecutivePLC: Int = 0
     private let maxConsecutivePLC: Int = 25 // ~250ms @ 10ms tick
+    /// Set when the sender's terminator packet arrives while audio is still
+    /// queued. The drain loop plays out all buffered frames first, then resets
+    /// cleanly — without this, a terminator in the same TCP batch as the last
+    /// audio frames causes reset() to discard them, clipping the last syllable.
+    private var pendingTerminator = false
     /// Mumble frame_number counts 10 ms units (480 samples @ 48 kHz). A sender
     /// using 20 ms frames increments sequence by 2 per packet, not 1. We detect
     /// the step from the first two distinct sequence numbers so that FEC lookups
@@ -159,8 +164,29 @@ final class JitterBuffer {
         }
     }
 
-    /// Reset everything (call on terminator packet, sender silence, or speaker
-    /// switch). Resets internal Opus decoder state too.
+    /// Called when the sender's end-of-utterance terminator arrives. If audio
+    /// is still queued (terminator arrived in the same TCP batch as the last
+    /// frames), defers the reset so the drain loop can play those frames first.
+    /// If nothing is queued, resets immediately like reset() used to.
+    func onTerminator() {
+        lock.withLock {
+            if packets.isEmpty || nextSeq == nil {
+                packets.removeAll(keepingCapacity: true)
+                nextSeq = nil
+                lastArrivalHostTime = nil
+                firstFrameDeadline = nil
+                consecutivePLC = 0
+                pendingTerminator = false
+                seqStep = 1; seqStepDetected = false; firstReceivedSeq = nil
+                try? decoder.resetState()
+            } else {
+                pendingTerminator = true
+            }
+        }
+    }
+
+    /// Hard reset — used when forcibly tearing down the session (user leaves
+    /// channel, disconnect). Resets internal Opus decoder state too.
     func reset() {
         lock.withLock {
             packets.removeAll(keepingCapacity: true)
@@ -168,6 +194,7 @@ final class JitterBuffer {
             lastArrivalHostTime = nil
             firstFrameDeadline = nil
             consecutivePLC = 0
+            pendingTerminator = false
             seqStep = 1; seqStepDetected = false; firstReceivedSeq = nil
             try? decoder.resetState()
         }
@@ -237,30 +264,41 @@ final class JitterBuffer {
                 nextSeq = want &+ seqStep
                 consecutivePLC = 0
             } else {
-                // Neither is present yet. If we've waited more than one
-                // frame interval past the expected arrival of `want`, give
-                // up and emit PLC to keep playback continuous. Otherwise
-                // wait one more tick.
-                let oneFrameMs = Double(frameSize) / sampleRate * 1000
-                let stale = (lastArrivalHostTime.map { (now - $0) * 1000 } ?? .infinity) > oneFrameMs * 1.5
-                if stale {
-                    consecutivePLC &+= 1
-                    if consecutivePLC > maxConsecutivePLC {
-                        // Sender has gone silent without a terminator. Stop
-                        // emitting PLC (which would otherwise pile silence
-                        // into the output ring at 2× wall-clock rate, since
-                        // each tick decodes a 20ms frame) and let the next
-                        // real packet re-anchor playback timing.
-                        nextSeq = nil
-                        firstFrameDeadline = nil
-                        consecutivePLC = 0
-                        action = .none
-                    } else {
-                        nextSeq = want &+ seqStep
-                        action = .plc
-                    }
+                // Neither is present yet.
+                if pendingTerminator {
+                    // All real frames have drained; the terminator was waiting.
+                    // Reset cleanly without emitting PLC for the missing packet.
+                    nextSeq = nil
+                    firstFrameDeadline = nil
+                    consecutivePLC = 0
+                    pendingTerminator = false
+                    seqStep = 1; seqStepDetected = false; firstReceivedSeq = nil
+                    action = .resetDecoder
                 } else {
-                    action = .none
+                    // If we've waited more than one frame interval past the
+                    // expected arrival of `want`, give up and emit PLC to keep
+                    // playback continuous. Otherwise wait one more tick.
+                    let oneFrameMs = Double(frameSize) / sampleRate * 1000
+                    let stale = (lastArrivalHostTime.map { (now - $0) * 1000 } ?? .infinity) > oneFrameMs * 1.5
+                    if stale {
+                        consecutivePLC &+= 1
+                        if consecutivePLC > maxConsecutivePLC {
+                            // Sender has gone silent without a terminator. Stop
+                            // emitting PLC (which would otherwise pile silence
+                            // into the output ring at 2× wall-clock rate, since
+                            // each tick decodes a 20ms frame) and let the next
+                            // real packet re-anchor playback timing.
+                            nextSeq = nil
+                            firstFrameDeadline = nil
+                            consecutivePLC = 0
+                            action = .none
+                        } else {
+                            nextSeq = want &+ seqStep
+                            action = .plc
+                        }
+                    } else {
+                        action = .none
+                    }
                 }
             }
 
@@ -276,10 +314,11 @@ final class JitterBuffer {
         case .play(let data): emitDecoded(data)
         case .fec(let nextData): emitFEC(from: nextData)
         case .plc: emitPLC()
+        case .resetDecoder: try? decoder.resetState()
         }
     }
 
-    private enum DrainAction { case none, play(Data), fec(Data), plc }
+    private enum DrainAction { case none, play(Data), fec(Data), plc, resetDecoder }
 
     // MARK: - Decode helpers (off-lock, called serially from queue)
 

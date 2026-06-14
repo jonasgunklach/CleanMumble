@@ -879,11 +879,8 @@ class RealMumbleClient: ObservableObject {
         let isTerminator = (rawLen & (1 << 13)) != 0
         let opusLen = Int(rawLen & ~(1 << 13))
         if isTerminator {
-            // Reset only the playback timing, NOT the Opus decoder. Discarding
-            // the decoder corrupts LPC predictor warm-up and produces an audible
-            // click on the first frame of the next utterance.
             playQueues[Int32(senderSession)] = nil
-            jitterBuffers[Int32(senderSession)]?.reset()
+            jitterBuffers[Int32(senderSession)]?.onTerminator()
             return
         }
         guard opusLen > 0, pos + opusLen <= payload.count else { return }
@@ -911,11 +908,8 @@ class RealMumbleClient: ObservableObject {
             }
         }
         if isTerminator {
-            // Reset only the playback timing, NOT the Opus decoder. Discarding
-            // the decoder corrupts LPC predictor warm-up and produces an audible
-            // click on the first frame of the next utterance.
             playQueues[Int32(senderSession)] = nil
-            jitterBuffers[Int32(senderSession)]?.reset()
+            jitterBuffers[Int32(senderSession)]?.onTerminator()
             return
         }
         guard let opusBytes = opusData, !opusBytes.isEmpty else { return }
