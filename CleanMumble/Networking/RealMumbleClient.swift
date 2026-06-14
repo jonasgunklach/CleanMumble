@@ -354,6 +354,7 @@ class RealMumbleClient: ObservableObject {
         let tcp = NWProtocolTCP.Options()
         tcp.enableKeepalive = true
         tcp.keepaliveIdle   = 30
+        tcp.noDelay         = true   // Nagle off — send each audio frame immediately
 
         let params = NWParameters(tls: tls, tcp: tcp)
         let conn   = NWConnection(to: endpoint, using: params)
