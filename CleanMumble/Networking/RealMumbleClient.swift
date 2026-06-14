@@ -354,6 +354,7 @@ class RealMumbleClient: ObservableObject {
         let tcp = NWProtocolTCP.Options()
         tcp.enableKeepalive = true
         tcp.keepaliveIdle   = 30
+        tcp.noDelay         = true   // Nagle off — send each audio frame immediately
 
         let params = NWParameters(tls: tls, tcp: tcp)
         let conn   = NWConnection(to: endpoint, using: params)
@@ -879,11 +880,8 @@ class RealMumbleClient: ObservableObject {
         let isTerminator = (rawLen & (1 << 13)) != 0
         let opusLen = Int(rawLen & ~(1 << 13))
         if isTerminator {
-            // Reset only the playback timing, NOT the Opus decoder. Discarding
-            // the decoder corrupts LPC predictor warm-up and produces an audible
-            // click on the first frame of the next utterance.
             playQueues[Int32(senderSession)] = nil
-            jitterBuffers[Int32(senderSession)]?.reset()
+            jitterBuffers[Int32(senderSession)]?.onTerminator()
             return
         }
         guard opusLen > 0, pos + opusLen <= payload.count else { return }
@@ -911,11 +909,8 @@ class RealMumbleClient: ObservableObject {
             }
         }
         if isTerminator {
-            // Reset only the playback timing, NOT the Opus decoder. Discarding
-            // the decoder corrupts LPC predictor warm-up and produces an audible
-            // click on the first frame of the next utterance.
             playQueues[Int32(senderSession)] = nil
-            jitterBuffers[Int32(senderSession)]?.reset()
+            jitterBuffers[Int32(senderSession)]?.onTerminator()
             return
         }
         guard let opusBytes = opusData, !opusBytes.isEmpty else { return }
@@ -1767,7 +1762,10 @@ class RealMumbleClient: ObservableObject {
     /// Uses protobuf v2 format when the server is Mumble ≥ 1.5, legacy otherwise.
     private func sendAudioFrame(_ opusData: Data) {
         let seq = audioSequence
-        audioSequence &+= 1
+        // frame_number counts 10 ms units per the Mumble spec. A 20 ms frame spans
+        // 2 × 10 ms, so step = opusFrameMs / 10. Sending step=1 for 20 ms frames
+        // makes every other packet look missing to the remote jitter buffer.
+        audioSequence &+= UInt64(opusFrameMs / 10)
 
         var packet = Data()
         if serverUseProtobufAudio {
@@ -1798,7 +1796,7 @@ class RealMumbleClient: ObservableObject {
     /// hides the speaking indicator immediately rather than timing out.
     private func sendTerminator() {
         let seq = audioSequence
-        audioSequence &+= 1
+        audioSequence &+= UInt64(opusFrameMs / 10)
         var packet = Data()
         if serverUseProtobufAudio {
             packet.append(UInt8(0x00))

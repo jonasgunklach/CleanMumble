@@ -59,6 +59,13 @@ final class JitterBuffer {
     private var jitterEMA: Double = 0           // exponentially-smoothed jitter (ms)
     private var jitterVAR: Double = 0           // variance estimator (ms²)
     private var firstFrameDeadline: TimeInterval?
+    /// Wall-clock deadline by which the next frame must arrive before stale is
+    /// declared. Anchored to playback time (now + frameInterval after each play)
+    /// so it tracks the playback timeline rather than packet arrival time. This
+    /// prevents false stale fires when the server TCP-batches multiple frames:
+    /// the batch drains quickly, but nextFrameDueTime advances one frame per
+    /// play, giving the next batch time to arrive without triggering PLC.
+    private var nextFrameDueTime: TimeInterval = 0
     private var timer: DispatchSourceTimer?
     /// True when `timer` is currently suspended to save power. The timer is
     /// suspended whenever there's nothing to drain (no anchored playhead and
@@ -77,7 +84,19 @@ final class JitterBuffer {
     /// re-anchors `nextSeq` instead of trying to "catch up" by emitting
     /// thousands of silence frames into the output ring.
     private var consecutivePLC: Int = 0
-    private let maxConsecutivePLC: Int = 25 // ~250ms @ 10ms tick
+    private let maxConsecutivePLC: Int = 8  // ~80ms @ 10ms tick before giving up
+    /// Set when the sender's terminator packet arrives while audio is still
+    /// queued. The drain loop plays out all buffered frames first, then resets
+    /// cleanly — without this, a terminator in the same TCP batch as the last
+    /// audio frames causes reset() to discard them, clipping the last syllable.
+    private var pendingTerminator = false
+    /// Mumble frame_number counts 10 ms units (480 samples @ 48 kHz). A sender
+    /// using 20 ms frames increments sequence by 2 per packet, not 1. We detect
+    /// the step from the first two distinct sequence numbers so that FEC lookups
+    /// and nextSeq advancement stay aligned with the actual sender cadence.
+    private var seqStep: UInt32 = 1
+    private var seqStepDetected: Bool = false
+    private var firstReceivedSeq: UInt32? = nil
 
     /// Snapshot the running loss-rate counters since the last call. Returns
     /// `(played, fec, plc)` and clears the windowed counters so the next call
@@ -119,7 +138,7 @@ final class JitterBuffer {
             lastArrivalHostTime = now
 
             // Drop ancient packets (already past playback deadline).
-            if let nxt = nextSeq, seq < nxt && nxt - seq > 8 {
+            if let nxt = nextSeq, seq < nxt && nxt - seq > 8 &* seqStep {
                 return
             }
             packets[seq] = opus
@@ -128,6 +147,21 @@ final class JitterBuffer {
             if nextSeq == nil {
                 nextSeq = seq
                 firstFrameDeadline = now + targetDepthMs / 1000.0
+                firstReceivedSeq = seq
+            }
+
+            // Detect sender's sequence step from the first two distinct seq numbers.
+            // Corrects nextSeq if the drain timer already advanced it by 1 before
+            // the step was known.
+            if !seqStepDetected, let f = firstReceivedSeq, seq != f {
+                let delta = seq &- f
+                if delta >= 1 && delta <= 8 {
+                    seqStep = delta
+                    seqStepDetected = true
+                    if let nxt = nextSeq, nxt == f &+ 1 {
+                        nextSeq = f &+ seqStep
+                    }
+                }
             }
             // Resume the drain timer if we'd suspended it during idle.
             if timerSuspended, let t = timer {
@@ -137,8 +171,30 @@ final class JitterBuffer {
         }
     }
 
-    /// Reset everything (call on terminator packet, sender silence, or speaker
-    /// switch). Resets internal Opus decoder state too.
+    /// Called when the sender's end-of-utterance terminator arrives. If audio
+    /// is still queued (terminator arrived in the same TCP batch as the last
+    /// frames), defers the reset so the drain loop can play those frames first.
+    /// If nothing is queued, resets immediately like reset() used to.
+    func onTerminator() {
+        lock.withLock {
+            if packets.isEmpty || nextSeq == nil {
+                packets.removeAll(keepingCapacity: true)
+                nextSeq = nil
+                lastArrivalHostTime = nil
+                firstFrameDeadline = nil
+                consecutivePLC = 0
+                nextFrameDueTime = 0
+                pendingTerminator = false
+                seqStep = 1; seqStepDetected = false; firstReceivedSeq = nil
+                try? decoder.resetState()
+            } else {
+                pendingTerminator = true
+            }
+        }
+    }
+
+    /// Hard reset — used when forcibly tearing down the session (user leaves
+    /// channel, disconnect). Resets internal Opus decoder state too.
     func reset() {
         lock.withLock {
             packets.removeAll(keepingCapacity: true)
@@ -146,6 +202,9 @@ final class JitterBuffer {
             lastArrivalHostTime = nil
             firstFrameDeadline = nil
             consecutivePLC = 0
+            nextFrameDueTime = 0
+            pendingTerminator = false
+            seqStep = 1; seqStepDetected = false; firstReceivedSeq = nil
             try? decoder.resetState()
         }
     }
@@ -203,41 +262,69 @@ final class JitterBuffer {
             }
             firstFrameDeadline = nil
 
+            let frameSeconds = Double(frameSize) / sampleRate
             let action: DrainAction
             if let p = packets.removeValue(forKey: want) {
                 action = .play(p)
-                nextSeq = want &+ 1
+                nextSeq = want &+ seqStep
                 consecutivePLC = 0
-            } else if let next = packets[want &+ 1] {
-                // Packet for `want` is missing, but `want+1` is here — try FEC.
+                nextFrameDueTime = now + frameSeconds
+            } else if let next = packets[want &+ seqStep] {
+                // Packet for `want` is missing, but the next expected seq is here — try FEC.
                 action = .fec(next)
-                nextSeq = want &+ 1
+                nextSeq = want &+ seqStep
                 consecutivePLC = 0
+                nextFrameDueTime = now + frameSeconds
             } else {
-                // Neither is present yet. If we've waited more than one
-                // frame interval past the expected arrival of `want`, give
-                // up and emit PLC to keep playback continuous. Otherwise
-                // wait one more tick.
-                let oneFrameMs = Double(frameSize) / sampleRate * 1000
-                let stale = (lastArrivalHostTime.map { (now - $0) * 1000 } ?? .infinity) > oneFrameMs * 1.5
-                if stale {
-                    consecutivePLC &+= 1
-                    if consecutivePLC > maxConsecutivePLC {
-                        // Sender has gone silent without a terminator. Stop
-                        // emitting PLC (which would otherwise pile silence
-                        // into the output ring at 2× wall-clock rate, since
-                        // each tick decodes a 20ms frame) and let the next
-                        // real packet re-anchor playback timing.
-                        nextSeq = nil
-                        firstFrameDeadline = nil
-                        consecutivePLC = 0
-                        action = .none
-                    } else {
-                        nextSeq = want &+ 1
-                        action = .plc
-                    }
+                // Neither is present yet.
+                if pendingTerminator {
+                    // All real frames have drained; the terminator was waiting.
+                    // Reset cleanly without emitting PLC for the missing packet.
+                    nextSeq = nil
+                    firstFrameDeadline = nil
+                    consecutivePLC = 0
+                    nextFrameDueTime = 0
+                    pendingTerminator = false
+                    seqStep = 1; seqStepDetected = false; firstReceivedSeq = nil
+                    action = .resetDecoder
                 } else {
-                    action = .none
+                    // Stale detection anchored to playback timeline: when the server
+                    // TCP-batches frames, they drain faster than real-time but
+                    // nextFrameDueTime advances one frame per play — so we correctly
+                    // wait for the next batch rather than firing PLC immediately.
+                    // Fall back to arrival time before the first frame is played.
+                    let oneFrameMs = frameSeconds * 1000
+                    // Adaptive threshold: scale with observed jitter so high-jitter
+                    // paths (cellular, VPN) get more headroom before PLC fires.
+                    // Fixed 1.5× (30ms for 20ms frames) was too aggressive over TCP.
+                    let staleThresholdMs = max(oneFrameMs * 2.0, targetDepthMs * 0.75)
+                    let lateMs: Double
+                    if nextFrameDueTime > 0 {
+                        lateMs = max(0, now - nextFrameDueTime) * 1000
+                    } else {
+                        lateMs = lastArrivalHostTime.map { (now - $0) * 1000 } ?? .infinity
+                    }
+                    if lateMs > staleThresholdMs {
+                        consecutivePLC &+= 1
+                        if consecutivePLC > maxConsecutivePLC {
+                            // Sender has gone silent without a terminator. Stop
+                            // emitting PLC (which would otherwise pile silence
+                            // into the output ring at 2× wall-clock rate, since
+                            // each tick decodes a 20ms frame) and let the next
+                            // real packet re-anchor playback timing.
+                            nextSeq = nil
+                            firstFrameDeadline = nil
+                            consecutivePLC = 0
+                            nextFrameDueTime = 0
+                            action = .none
+                        } else {
+                            nextSeq = want &+ seqStep
+                            nextFrameDueTime = now + frameSeconds
+                            action = .plc
+                        }
+                    } else {
+                        action = .none
+                    }
                 }
             }
 
@@ -253,10 +340,11 @@ final class JitterBuffer {
         case .play(let data): emitDecoded(data)
         case .fec(let nextData): emitFEC(from: nextData)
         case .plc: emitPLC()
+        case .resetDecoder: try? decoder.resetState()
         }
     }
 
-    private enum DrainAction { case none, play(Data), fec(Data), plc }
+    private enum DrainAction { case none, play(Data), fec(Data), plc, resetDecoder }
 
     // MARK: - Decode helpers (off-lock, called serially from queue)
 

@@ -915,13 +915,41 @@ final class CoreAudioOutput {
 
     init(ringCapacityFrames: Int = 48_000 /* 1s @ 48kHz mono */) {
         self.ring = FloatRingBuffer(capacity: ringCapacityFrames)
-        // Per-sender rings are intentionally MUCH smaller than the legacy
-        // single ring: capping at ~200ms keeps round-trip latency bounded
-        // when a producer outpaces the consumer (e.g. JitterBuffer PLC
-        // emitting 20ms decoded frames every 10ms tick → 2× fill rate).
-        // When the ring is full new writes drop oldest, so the worst-case
-        // perceived latency is ~200ms + the JB target depth.
-        self.senderRingCapacity = 9_600 // 200ms @ 48kHz mono
+        // Per-sender ring capacity: 1 s (48 000 samples @ 48 kHz mono).
+        //
+        // The original 200 ms (9 600 samples) cap was chosen to bound latency
+        // when PLC ran at 2× real-time: the JitterBuffer timer fires every
+        // 10 ms but each PLC tick emits a 20 ms frame, so PLC fills the ring
+        // twice as fast as CoreAudio drains it — a 200 ms ring would fill in
+        // ~100 ms of continuous PLC, after which oldest audio would be dropped.
+        //
+        // That reasoning no longer applies after two upstream fixes landed in
+        // this branch:
+        //
+        //  1. nextFrameDueTime (see "Fix spurious PLC between TCP bursts"):
+        //     stale detection is now anchored to the playback timeline rather
+        //     than packet arrival time. TCP-batched bursts drain faster than
+        //     real-time, but the deadline advances one frame per play, so PLC
+        //     does not fire between bursts. Continuous PLC is now only emitted
+        //     for genuine packet loss, which on a Mumble TCP connection is rare.
+        //
+        //  2. Adaptive stale threshold (max(2×frameMs, 0.75×targetDepthMs)):
+        //     single delayed packets on high-jitter paths that would previously
+        //     trigger a PLC cycle now wait long enough for the real packet to
+        //     arrive. This further reduces spurious PLC events.
+        //
+        // With PLC bursts effectively eliminated, the 2× fill-rate hazard is
+        // gone. The remaining risk is a TCP retransmit delivering a large burst
+        // of queued frames all at once: the JitterBuffer drains them faster than
+        // real-time and all decoded PCM lands in the ring before CoreAudio can
+        // keep up. On paths with RTT > 100 ms a single retransmit can queue
+        // 300–500 ms of audio. A 200 ms ring overflows in that scenario and the
+        // oldest frames are silently dropped, producing an audible glitch.
+        //
+        // 1 s (48 000 samples) absorbs even a worst-case retransmit burst while
+        // keeping worst-case latency at 1 s + JB target depth — still well below
+        // the 2–3 s that human conversation can tolerate.
+        self.senderRingCapacity = 48_000 // 1 s @ 48 kHz mono
         senderRingsLock.initialize(to: os_unfair_lock())
     }
 
