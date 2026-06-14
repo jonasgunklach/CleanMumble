@@ -84,7 +84,7 @@ final class JitterBuffer {
     /// re-anchors `nextSeq` instead of trying to "catch up" by emitting
     /// thousands of silence frames into the output ring.
     private var consecutivePLC: Int = 0
-    private let maxConsecutivePLC: Int = 25 // ~250ms @ 10ms tick
+    private let maxConsecutivePLC: Int = 8  // ~80ms @ 10ms tick before giving up
     /// Set when the sender's terminator packet arrives while audio is still
     /// queued. The drain loop plays out all buffered frames first, then resets
     /// cleanly — without this, a terminator in the same TCP batch as the last
