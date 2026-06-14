@@ -78,6 +78,13 @@ final class JitterBuffer {
     /// thousands of silence frames into the output ring.
     private var consecutivePLC: Int = 0
     private let maxConsecutivePLC: Int = 25 // ~250ms @ 10ms tick
+    /// Mumble frame_number counts 10 ms units (480 samples @ 48 kHz). A sender
+    /// using 20 ms frames increments sequence by 2 per packet, not 1. We detect
+    /// the step from the first two distinct sequence numbers so that FEC lookups
+    /// and nextSeq advancement stay aligned with the actual sender cadence.
+    private var seqStep: UInt32 = 1
+    private var seqStepDetected: Bool = false
+    private var firstReceivedSeq: UInt32? = nil
 
     /// Snapshot the running loss-rate counters since the last call. Returns
     /// `(played, fec, plc)` and clears the windowed counters so the next call
@@ -119,7 +126,7 @@ final class JitterBuffer {
             lastArrivalHostTime = now
 
             // Drop ancient packets (already past playback deadline).
-            if let nxt = nextSeq, seq < nxt && nxt - seq > 8 {
+            if let nxt = nextSeq, seq < nxt && nxt - seq > 8 &* seqStep {
                 return
             }
             packets[seq] = opus
@@ -128,6 +135,21 @@ final class JitterBuffer {
             if nextSeq == nil {
                 nextSeq = seq
                 firstFrameDeadline = now + targetDepthMs / 1000.0
+                firstReceivedSeq = seq
+            }
+
+            // Detect sender's sequence step from the first two distinct seq numbers.
+            // Corrects nextSeq if the drain timer already advanced it by 1 before
+            // the step was known.
+            if !seqStepDetected, let f = firstReceivedSeq, seq != f {
+                let delta = seq &- f
+                if delta >= 1 && delta <= 8 {
+                    seqStep = delta
+                    seqStepDetected = true
+                    if let nxt = nextSeq, nxt == f &+ 1 {
+                        nextSeq = f &+ seqStep
+                    }
+                }
             }
             // Resume the drain timer if we'd suspended it during idle.
             if timerSuspended, let t = timer {
@@ -146,6 +168,7 @@ final class JitterBuffer {
             lastArrivalHostTime = nil
             firstFrameDeadline = nil
             consecutivePLC = 0
+            seqStep = 1; seqStepDetected = false; firstReceivedSeq = nil
             try? decoder.resetState()
         }
     }
@@ -206,12 +229,12 @@ final class JitterBuffer {
             let action: DrainAction
             if let p = packets.removeValue(forKey: want) {
                 action = .play(p)
-                nextSeq = want &+ 1
+                nextSeq = want &+ seqStep
                 consecutivePLC = 0
-            } else if let next = packets[want &+ 1] {
-                // Packet for `want` is missing, but `want+1` is here — try FEC.
+            } else if let next = packets[want &+ seqStep] {
+                // Packet for `want` is missing, but the next expected seq is here — try FEC.
                 action = .fec(next)
-                nextSeq = want &+ 1
+                nextSeq = want &+ seqStep
                 consecutivePLC = 0
             } else {
                 // Neither is present yet. If we've waited more than one
@@ -233,7 +256,7 @@ final class JitterBuffer {
                         consecutivePLC = 0
                         action = .none
                     } else {
-                        nextSeq = want &+ 1
+                        nextSeq = want &+ seqStep
                         action = .plc
                     }
                 } else {
