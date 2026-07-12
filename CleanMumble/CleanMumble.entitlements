@@ -18,6 +18,8 @@
 	<true/>
 	<key>com.apple.security.device.microphone</key>
 	<true/>
+	<key>com.apple.security.device.bluetooth</key>
+	<true/>
 	<key>com.apple.security.network.dns</key>
 	<true/>
 	<key>com.apple.security.temporary-exception.mach-lookup.global-name</key>

@@ -44,10 +44,16 @@ final class IOSAudioSession {
             // echo cancellation, prefers a low-latency I/O buffer, ducks music
             // during speech rather than killing it. .allowBluetoothA2DP is
             // critical for AirPods quality (HFP is 8 kHz mono and sounds awful).
+            // .bluetoothHighQualityRecording (iOS 26) opts into Apple's
+            // high-quality Bluetooth voice link on H2-class AirPods
+            // (AirPods 4 / Pro 2 / Pro 3): full-bandwidth mic without
+            // collapsing playback to HFP; unsupported headsets silently
+            // fall back to the HFP path.
             try session.setCategory(
                 .playAndRecord,
                 mode: .voiceChat,
-                options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker]
+                options: [.allowBluetoothHFP, .allowBluetoothA2DP,
+                          .bluetoothHighQualityRecording, .defaultToSpeaker]
             )
             try session.setActive(true, options: [.notifyOthersOnDeactivation])
             isActive = true

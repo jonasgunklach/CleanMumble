@@ -7,7 +7,12 @@
 
 import SwiftUI
 import UniformTypeIdentifiers
+#if os(macOS)
 import AppKit
+#else
+import UIKit
+import PhotosUI
+#endif
 
 // MARK: - Chat message model
 
@@ -34,14 +39,21 @@ struct ChatMessage: Identifiable, Codable {
 // MARK: - Helpers
 
 private func compressIfNeeded(_ data: Data) -> Data {
-    guard data.count > 750_000,
-          let nsImage = NSImage(data: data),
+    guard data.count > 750_000 else { return data }
+    #if os(macOS)
+    guard let nsImage = NSImage(data: data),
           let tiff = nsImage.tiffRepresentation,
           let bitmap = NSBitmapImageRep(data: tiff),
           let jpeg = bitmap.representation(using: .jpeg,
                                            properties: [.compressionFactor: NSNumber(value: 0.7)])
     else { return data }
     return jpeg
+    #else
+    guard let uiImage = UIImage(data: data),
+          let jpeg = uiImage.jpegData(compressionQuality: 0.7)
+    else { return data }
+    return jpeg
+    #endif
 }
 
 private func loadImageFromURL(_ url: URL) -> Data? {
@@ -49,6 +61,16 @@ private func loadImageFromURL(_ url: URL) -> Data? {
     return compressIfNeeded(raw)
 }
 
+/// Decodes image bytes into a SwiftUI Image, whatever the platform.
+private func decodedImage(_ data: Data) -> Image? {
+    #if os(macOS)
+    return NSImage(data: data).map { Image(nsImage: $0) }
+    #else
+    return UIImage(data: data).map { Image(uiImage: $0) }
+    #endif
+}
+
+#if os(macOS)
 /// Saves image bytes to ~/Downloads with a timestamped filename.
 private func saveImageToDownloads(_ data: Data) {
     let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
@@ -62,6 +84,41 @@ private func saveImageToDownloads(_ data: Data) {
     } catch {
         print("[Chat] saveImageToDownloads failed: \(error)")
     }
+}
+#endif
+
+/// Context-menu item for image bytes: Save to Downloads on macOS, the
+/// system share sheet (→ Save Image / Save to Files) on iOS.
+@ViewBuilder
+private func imageSaveMenuItems(for data: Data) -> some View {
+    #if os(macOS)
+    Button { saveImageToDownloads(data) } label: {
+        Label("Save to Downloads", systemImage: "square.and.arrow.down")
+    }
+    #else
+    if let uiImage = UIImage(data: data) {
+        let img = Image(uiImage: uiImage)
+        ShareLink(item: img, preview: SharePreview("Image", image: img)) {
+            Label("Share…", systemImage: "square.and.arrow.up")
+        }
+    }
+    #endif
+}
+
+/// Same, for a remote image URL.
+@ViewBuilder
+private func imageSaveMenuItems(for url: URL) -> some View {
+    #if os(macOS)
+    Button {
+        Task { if let data = try? Data(contentsOf: url) { saveImageToDownloads(data) } }
+    } label: {
+        Label("Save to Downloads", systemImage: "square.and.arrow.down")
+    }
+    #else
+    ShareLink(item: url) {
+        Label("Share…", systemImage: "square.and.arrow.up")
+    }
+    #endif
 }
 
 // MARK: - Lightbox
@@ -178,26 +235,16 @@ struct LightboxView: View {
 
     @ViewBuilder
     private func mainImageView(for item: LightboxItem) -> some View {
-        if let data = item.imageData, let nsImage = NSImage(data: data) {
-            Image(nsImage: nsImage)
+        if let data = item.imageData, let image = decodedImage(data) {
+            image
                 .resizable().scaledToFit().padding(40)
-                .contextMenu {
-                    Button { saveImageToDownloads(data) } label: {
-                        Label("Save to Downloads", systemImage: "square.and.arrow.down")
-                    }
-                }
+                .contextMenu { imageSaveMenuItems(for: data) }
         } else if let urlString = item.imageURL, let url = URL(string: urlString) {
             AsyncImage(url: url) { phase in
                 switch phase {
                 case .success(let img):
                     img.resizable().scaledToFit().padding(40)
-                        .contextMenu {
-                            Button {
-                                Task { if let data = try? Data(contentsOf: url) { saveImageToDownloads(data) } }
-                            } label: {
-                                Label("Save to Downloads", systemImage: "square.and.arrow.down")
-                            }
-                        }
+                        .contextMenu { imageSaveMenuItems(for: url) }
                 case .empty:   ProgressView().tint(.white)
                 case .failure: Label("Failed to load", systemImage: "exclamationmark.triangle").foregroundColor(.white.opacity(0.6))
                 @unknown default: EmptyView()
@@ -230,8 +277,8 @@ struct LightboxView: View {
     @ViewBuilder
     private func thumbnailCell(for item: LightboxItem, isSelected: Bool) -> some View {
         Group {
-            if let data = item.imageData, let nsImage = NSImage(data: data) {
-                Image(nsImage: nsImage).resizable().scaledToFill()
+            if let data = item.imageData, let image = decodedImage(data) {
+                image.resizable().scaledToFill()
             } else if let urlString = item.imageURL, let url = URL(string: urlString) {
                 AsyncImage(url: url) { phase in
                     if case .success(let img) = phase { img.resizable().scaledToFill() }
@@ -259,6 +306,7 @@ struct LightboxView: View {
     private func next()    { guard index < items.count - 1 else { return }; withAnimation { currentIndex = index + 1; scale = 1 } }
 
     private func startKeyMonitor() {
+        #if os(macOS)
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             switch event.keyCode {
             case 123: prev();    return nil  // ←
@@ -267,14 +315,19 @@ struct LightboxView: View {
             default:             return event
             }
         }
+        #endif
     }
 
     private func stopKeyMonitor() {
+        #if os(macOS)
         if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
+        #endif
     }
 }
 
 // MARK: - Paste-aware TextField
+
+#if os(macOS)
 
 /// Wraps NSTextField to intercept Cmd+V when the clipboard holds image data.
 struct PasteAwareTextField: NSViewRepresentable {
@@ -363,6 +416,25 @@ private class PasteTextField: NSTextField {
     }
 }
 
+#else
+
+/// iOS counterpart: a plain TextField. Image paste arrives via the system
+/// paste menu; a long-press paste of images can be added later if needed.
+struct PasteAwareTextField: View {
+    @Binding var text: String
+    var placeholder: String
+    var onSubmit: () -> Void
+    var onPasteImage: (Data) -> Void
+
+    var body: some View {
+        TextField(placeholder, text: $text)
+            .textFieldStyle(.plain)
+            .onSubmit(onSubmit)
+    }
+}
+
+#endif
+
 // MARK: - ChatView
 
 struct ChatView: View {
@@ -370,6 +442,10 @@ struct ChatView: View {
     @State private var messageText = ""
     @State private var isDroppingOver = false
     @State private var lightboxCurrentIndex: Int? = nil
+    #if !os(macOS)
+    @State private var showingPhotoPicker = false
+    @State private var photoPickerItem: PhotosPickerItem? = nil
+    #endif
 
     private var allImages: [LightboxItem] {
         viewModel.chatMessages.compactMap { msg in
@@ -430,7 +506,7 @@ struct ChatView: View {
 
                 PasteAwareTextField(
                     text: $messageText,
-                    placeholder: "Type a message… (⌘V to paste image)",
+                    placeholder: inputPlaceholder,
                     onSubmit: sendMessage,
                     onPasteImage: { data in
                         viewModel.sendImageMessage(data)
@@ -450,13 +526,42 @@ struct ChatView: View {
             }
             .padding()
         }
-        .background(Color(NSColor.textBackgroundColor))
+        .background(chatBackground)
         .overlay {
             if lightboxCurrentIndex != nil {
                 LightboxView(items: allImages, currentIndex: $lightboxCurrentIndex)
                     .transition(.opacity.animation(.easeInOut(duration: 0.2)))
             }
         }
+        #if !os(macOS)
+        .photosPicker(isPresented: $showingPhotoPicker,
+                      selection: $photoPickerItem,
+                      matching: .images)
+        .onChange(of: photoPickerItem) { item in
+            guard let item else { return }
+            photoPickerItem = nil
+            Task {
+                guard let data = try? await item.loadTransferable(type: Data.self) else { return }
+                viewModel.sendImageMessage(compressIfNeeded(data))
+            }
+        }
+        #endif
+    }
+
+    private var inputPlaceholder: String {
+        #if os(macOS)
+        return "Type a message… (⌘V to paste image)"
+        #else
+        return "Type a message…"
+        #endif
+    }
+
+    private var chatBackground: Color {
+        #if os(macOS)
+        return Color(NSColor.textBackgroundColor)
+        #else
+        return Color(UIColor.systemBackground)
+        #endif
     }
 
     @ViewBuilder
@@ -510,6 +615,7 @@ struct ChatView: View {
     }
 
     private func showImagePicker() {
+        #if os(macOS)
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.jpeg, .png, .gif, .bmp, .tiff, .webP]
         panel.allowsMultipleSelection = false
@@ -519,6 +625,9 @@ struct ChatView: View {
             guard let imageData = loadImageFromURL(url) else { return }
             DispatchQueue.main.async { viewModel.sendImageMessage(imageData) }
         }
+        #else
+        showingPhotoPicker = true
+        #endif
     }
 }
 
@@ -604,21 +713,15 @@ struct ChatMessageView: View {
 
     @ViewBuilder
     private var inlineImageView: some View {
-        if let data = message.imageData, let nsImage = NSImage(data: data) {
-            Image(nsImage: nsImage)
+        if let data = message.imageData, let image = decodedImage(data) {
+            image
                 .resizable()
                 .scaledToFit()
                 .frame(maxWidth: 300)
                 .cornerRadius(8)
                 .padding(.top, 2)
                 .onTapGesture { onImageTap?() }
-                .contextMenu {
-                    Button {
-                        saveImageToDownloads(data)
-                    } label: {
-                        Label("Save to Downloads", systemImage: "square.and.arrow.down")
-                    }
-                }
+                .contextMenu { imageSaveMenuItems(for: data) }
         } else if let urlString = message.imageURL, let url = URL(string: urlString) {
             AsyncImage(url: url) { phase in
                 switch phase {
@@ -628,18 +731,7 @@ struct ChatMessageView: View {
                         .frame(maxWidth: 300)
                         .cornerRadius(8)
                         .onTapGesture { onImageTap?() }
-                        .contextMenu {
-                            Button {
-                                // Download the remote image then save to Downloads
-                                Task {
-                                    if let data = try? Data(contentsOf: url) {
-                                        saveImageToDownloads(data)
-                                    }
-                                }
-                            } label: {
-                                Label("Save to Downloads", systemImage: "square.and.arrow.down")
-                            }
-                        }
+                        .contextMenu { imageSaveMenuItems(for: url) }
                 case .failure: EmptyView()
                 case .empty:   ProgressView().frame(width: 100, height: 60)
                 @unknown default: EmptyView()
@@ -678,12 +770,13 @@ struct ChatMessageView: View {
 
 struct LinkPreviewCard: View {
     let preview: LinkPreviewData
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Thumbnail
-            if let thumbData = preview.thumbnailData, let nsImage = NSImage(data: thumbData) {
-                Image(nsImage: nsImage)
+            if let thumbData = preview.thumbnailData, let image = decodedImage(thumbData) {
+                image
                     .resizable()
                     .scaledToFill()
                     .frame(maxWidth: .infinity, maxHeight: 120)
@@ -713,7 +806,7 @@ struct LinkPreviewCard: View {
             .padding(8)
         }
         .frame(maxWidth: 280)
-        .background(Color(NSColor.controlBackgroundColor))
+        .background(cardBackground)
         .cornerRadius(8)
         .overlay(
             RoundedRectangle(cornerRadius: 8)
@@ -721,9 +814,17 @@ struct LinkPreviewCard: View {
         )
         .onTapGesture {
             if let url = URL(string: preview.url) {
-                NSWorkspace.shared.open(url)
+                openURL(url)
             }
         }
+    }
+
+    private var cardBackground: Color {
+        #if os(macOS)
+        return Color(NSColor.controlBackgroundColor)
+        #else
+        return Color(UIColor.secondarySystemBackground)
+        #endif
     }
 
     private var accentBorderColor: Color {

@@ -7,7 +7,9 @@
 
 import SwiftUI
 import Foundation
+#if os(macOS)
 import CoreAudio
+#endif
 
 // MARK: - Color Extensions
 extension Color {
@@ -15,13 +17,29 @@ extension Color {
     static let mumbleGreen = Color(red: 0.2, green: 0.8, blue: 0.4)
     static let mumbleRed = Color(red: 1.0, green: 0.3, blue: 0.3)
     static let mumbleOrange = Color(red: 1.0, green: 0.6, blue: 0.2)
+
+    /// AppKit/UIKit-neutral semantic backgrounds.
+    static var mumbleControlBackground: Color {
+        #if os(macOS)
+        return Color(NSColor.controlBackgroundColor)
+        #else
+        return Color(UIColor.secondarySystemBackground)
+        #endif
+    }
+    static var mumbleWindowBackground: Color {
+        #if os(macOS)
+        return Color(NSColor.windowBackgroundColor)
+        #else
+        return Color(UIColor.systemBackground)
+        #endif
+    }
 }
 
 // MARK: - View Extensions
 extension View {
     func mumbleCard() -> some View {
         self
-            .background(Color(NSColor.controlBackgroundColor))
+            .background(Color.mumbleControlBackground)
             .cornerRadius(12)
             .shadow(color: .black.opacity(0.1), radius: 2, x: 0, y: 1)
     }
@@ -94,11 +112,16 @@ extension String {
 // MARK: - CoreAudio device enumeration
 
 struct AudioDeviceInfo: Identifiable, Hashable {
-    let id: AudioDeviceID  // UInt32 device ID
+    let id: UInt32  // CoreAudio AudioDeviceID on macOS
     let uid: String
     let name: String
 }
 
+#if !os(macOS)
+/// iOS routes audio via AVAudioSession — there is no per-device HAL
+/// enumeration; pickers show only "System Default".
+func listAudioDevices(input: Bool) -> [AudioDeviceInfo] { [] }
+#else
 func listAudioDevices(input: Bool) -> [AudioDeviceInfo] {
     var propAddr = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDevices,
@@ -152,6 +175,7 @@ private func audioDeviceStringProp(_ deviceID: AudioDeviceID,
     guard status == noErr, let s = cfStr else { return nil }
     return s as String
 }
+#endif
 
 // MARK: - Date Extensions
 extension Date {

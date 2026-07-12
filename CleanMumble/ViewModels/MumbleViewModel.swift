@@ -10,6 +10,7 @@ import SwiftUI
 import Combine
 import AVFoundation
 import AudioCore
+import AudioEngine
 
 @MainActor
 class MumbleViewModel: ObservableObject {
@@ -23,6 +24,8 @@ class MumbleViewModel: ObservableObject {
     @Published var isConnected: Bool = false
     @Published var isMuted: Bool = false
     @Published var isDeafened: Bool = false
+    /// Echo test (server loopback) active. Not persisted.
+    @Published var isLoopbackTesting: Bool = false
     @Published var isSpeaking: Bool = false
     @Published var inputVolume: Float = 1.0
     @Published var outputVolume: Float = 1.0
@@ -160,8 +163,8 @@ class MumbleViewModel: ObservableObject {
             }
         }
         IOSAudioSession.shared.onRouteChange = { [weak self] in
-            // The CoreAudioIO path (macOS) handles routing internally via AU
-            // listeners. On iOS, AVAudioEngine doesn't restart cleanly on a
+            // On macOS the AudioEngine controller handles route changes
+            // itself. On iOS, AVAudioEngine doesn't restart cleanly on a
             // route change, so we rebuild the graph.
             guard let client = self?.realMumbleClient else { return }
             client.stopAudioEngine()
@@ -264,7 +267,7 @@ class MumbleViewModel: ObservableObject {
             client.opusBitrate  = s.quality.bitrate
             client.opusFrameMs  = s.quality.frameMs
             client.opusLowDelay = s.quality.lowDelay
-            client.voiceProcessingMode = s.voiceProcessing.toCAInputMode
+            client.voiceProcessingMode = s.voiceProcessing.toProcessingMode
             client.enableAGC = s.enableAutomaticGainControl
             client.vadThreshold = 0.001 + Float(s.voiceActivityThreshold) * 0.049
             client.inputGain = s.inputVolume
@@ -282,6 +285,7 @@ class MumbleViewModel: ObservableObject {
         stopLevelMeterTimer()
         connectionState = .disconnected
         isConnected = false
+        isLoopbackTesting = false
         currentServer = nil
         channels = []
         users = []
@@ -328,6 +332,14 @@ class MumbleViewModel: ObservableObject {
         }
     }
 
+    /// Echo test (server loopback, voice target 31): the server sends our own
+    /// voice straight back, so the full transmit path — capture, encode,
+    /// encrypt, UDP, server — is verifiable without a second person.
+    func toggleLoopbackTest() {
+        isLoopbackTesting.toggle()
+        realMumbleClient?.loopbackEnabled = isLoopbackTesting
+    }
+
     func setInputVolume(_ volume: Float) {
         // 0 \u2026 4 = up to +12 dB pre-encoder gain. Clamped further inside the
         // GainProcessor (hard cap at 8\u00d7) for safety.
@@ -359,7 +371,7 @@ class MumbleViewModel: ObservableObject {
             client.opusBitrate  = settings.quality.bitrate
             client.opusFrameMs  = settings.quality.frameMs
             client.opusLowDelay = settings.quality.lowDelay
-            client.voiceProcessingMode = settings.voiceProcessing.toCAInputMode
+            client.voiceProcessingMode = settings.voiceProcessing.toProcessingMode
             client.enableAGC = settings.enableAutomaticGainControl
             // Map slider 0…1 → RMS 0.001 (very sensitive) … 0.05 (loud only).
             // Mumble-style voice activation: anything below the threshold is
@@ -465,13 +477,13 @@ class MumbleViewModel: ObservableObject {
     }
 
     private func refreshLevelMeters() {
-        guard let io = realMumbleClient?.coreAudioIOForUI else { return }
-        let micR = io.input.inputMeter.snapshot()
+        guard let engine = realMumbleClient?.voiceEngine else { return }
+        let micR = engine.capture.meter.snapshot()
         micLevelRMS = micR.rms
         micLevelPeak = micR.peakHold
-        let outR = io.output.outputMeter.snapshot()
-        outputLevelRMS = outR.rms
-        outputLevelPeak = outR.peakHold
+        let out = engine.playback.outputLevel()
+        outputLevelRMS = out.rms
+        outputLevelPeak = out.peak
     }
     
     private func updateAudioEngine() {

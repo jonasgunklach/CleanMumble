@@ -7,6 +7,7 @@
 
 import Foundation
 import SwiftUI
+import AudioEngine
 
 // MARK: - Connection State
 enum ConnectionState: String, CaseIterable {
@@ -101,13 +102,13 @@ enum VoiceProcessingChoice: String, Codable, CaseIterable, Identifiable {
         case .off:  return "Off"
         }
     }
-    /// Bridge to the CoreAudio layer's tri-state so callers don't have to
-    /// import CoreAudio just to map the enum.
-    var toCAInputMode: CoreAudioInput.VoiceProcessingMode {
+    /// Bridge to the audio engine's tri-state so callers don't have to map
+    /// the enum themselves.
+    var toProcessingMode: ProcessingMode {
         switch self {
         case .auto: return .auto
-        case .on:   return .on
-        case .off:  return .off
+        case .on:   return .voice
+        case .off:  return .raw
         }
     }
 }

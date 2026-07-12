@@ -16,12 +16,19 @@ struct CleanMumbleApp: App {
     }
 
     var body: some Scene {
+        #if os(macOS)
         WindowGroup {
             ContentView()
         }
         .windowStyle(.automatic)
         .windowResizability(.contentSize)
-        
+        #else
+        WindowGroup {
+            ContentView()
+        }
+        #endif
+
+
         #if os(macOS)
         Settings {
             SettingsView()

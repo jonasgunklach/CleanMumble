@@ -35,9 +35,21 @@ struct AudioControlsView: View {
                         .clipShape(Circle())
                 }
                 .buttonStyle(PlainButtonStyle())
-                
+
+                // Echo test (server loopback) button
+                Button(action: { viewModel.toggleLoopbackTest() }) {
+                    Image(systemName: "arrow.uturn.left.circle")
+                        .font(.title2)
+                        .foregroundColor(viewModel.isLoopbackTesting ? .purple : .primary)
+                        .frame(width: 44, height: 44)
+                        .background(viewModel.isLoopbackTesting ? Color.purple.opacity(0.2) : Color.secondary.opacity(0.2))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(PlainButtonStyle())
+                .help("Echo test: the server loops your own voice back so you can verify your microphone path")
+
                 Spacer()
-                
+
                 // Disconnect button
                 Button(action: { viewModel.disconnect() }) {
                     Image(systemName: "phone.down.fill")
@@ -124,7 +136,7 @@ struct AudioControlsView: View {
             }
         }
         .padding(.vertical)
-        .background(Color(NSColor.controlBackgroundColor))
+        .background(Color.mumbleControlBackground)
     }
 }
 

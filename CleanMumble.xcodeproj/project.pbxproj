@@ -11,6 +11,7 @@
 		A6279F892E8450820036F35B /* Opus in Frameworks */ = {isa = PBXBuildFile; productRef = A6279F872E8450820036F35B /* Opus */; };
 		CC1E000100000000000A0003 /* OpusControl in Frameworks */ = {isa = PBXBuildFile; productRef = CC1E000100000000000A0002 /* OpusControl */; };
 		CC1E000200000000000A0003 /* AudioCore in Frameworks */ = {isa = PBXBuildFile; productRef = CC1E000200000000000A0002 /* AudioCore */; };
+		CC1E000300000000000A0003 /* AudioEngine in Frameworks */ = {isa = PBXBuildFile; productRef = CC1E000300000000000A0002 /* AudioEngine */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -63,6 +64,7 @@
 				A6279F892E8450820036F35B /* Opus in Frameworks */,
 				CC1E000100000000000A0003 /* OpusControl in Frameworks */,
 				CC1E000200000000000A0003 /* AudioCore in Frameworks */,
+				CC1E000300000000000A0003 /* AudioEngine in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -127,6 +129,7 @@
 				A6279F872E8450820036F35B /* Opus */,
 				CC1E000100000000000A0002 /* OpusControl */,
 				CC1E000200000000000A0002 /* AudioCore */,
+				CC1E000300000000000A0002 /* AudioEngine */,
 			);
 			productName = CleanMumble;
 			productReference = A6279F532E8450810036F35B /* CleanMumble.app */;
@@ -214,6 +217,7 @@
 				A6279F852E8450820036F35B /* XCRemoteSwiftPackageReference "swift-opus" */,
 				CC1E000100000000000A0001 /* XCLocalSwiftPackageReference "Packages/OpusControl" */,
 				CC1E000200000000000A0001 /* XCLocalSwiftPackageReference "Packages/AudioCore" */,
+				CC1E000300000000000A0001 /* XCLocalSwiftPackageReference "Packages/AudioEngine" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = A6279F542E8450810036F35B /* Products */;
@@ -420,6 +424,7 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleIconName = AppIcon;
+				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "CleanMumble reads your paired headset model to pick the best voice quality (e.g. AirPods studio-quality voice).";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "CleanMumble needs microphone access to transmit your voice in channels.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -468,6 +473,7 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleIconName = AppIcon;
+				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "CleanMumble reads your paired headset model to pick the best voice quality (e.g. AirPods studio-quality voice).";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "CleanMumble needs microphone access to transmit your voice in channels.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -653,6 +659,10 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = Packages/AudioCore;
 		};
+		CC1E000300000000000A0001 /* XCLocalSwiftPackageReference "Packages/AudioEngine" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/AudioEngine;
+		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCRemoteSwiftPackageReference section */
@@ -686,6 +696,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = CC1E000200000000000A0001 /* XCLocalSwiftPackageReference "Packages/AudioCore" */;
 			productName = AudioCore;
+		};
+		CC1E000300000000000A0002 /* AudioEngine */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = CC1E000300000000000A0001 /* XCLocalSwiftPackageReference "Packages/AudioEngine" */;
+			productName = AudioEngine;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

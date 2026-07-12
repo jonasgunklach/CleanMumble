@@ -185,7 +185,7 @@ struct SettingsView: View {
             audioMonitor.stopMonitoring()
         }
         // React to connection state changes WHILE Settings is open: as soon
-        // as we connect, release the mic so the client's CoreAudioIO can
+        // as we connect, release the mic so the client's audio engine can
         // open it without EAGAIN ('error 35'). When we disconnect, resume
         // the monitor so the user can level-check again.
         .onChange(of: viewModel.isConnected) { _, connected in

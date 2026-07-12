@@ -340,7 +340,7 @@ struct SidebarAudioStrip: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
         }
-        .background(Color(NSColor.windowBackgroundColor))
+        .background(Color.mumbleWindowBackground)
     }
 }
 
@@ -503,7 +503,7 @@ struct QuickConnectRow: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
-        .background(Color(NSColor.controlBackgroundColor))
+        .background(Color.mumbleControlBackground)
         .cornerRadius(10)
     }
 }
