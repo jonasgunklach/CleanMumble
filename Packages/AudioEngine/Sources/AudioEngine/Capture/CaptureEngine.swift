@@ -22,6 +22,10 @@ public struct CaptureFormat: Equatable, Sendable {
     public var opusBitrate: Int = 40_000
     public var opusFrameMs: Int = 20          // 10 / 20 / 40 / 60
     public var opusLowDelay: Bool = false
+    /// VAD pre-roll: how much audio from just BEFORE the VAD fired is
+    /// transmitted with the utterance, so quiet word onsets aren't chopped.
+    /// 0 disables.
+    public var vadPreRollMs: Int = 40
     public init() {}
     public init(opusBitrate: Int, opusFrameMs: Int, opusLowDelay: Bool) {
         self.opusBitrate = opusBitrate
@@ -155,12 +159,24 @@ public final class CaptureEngine: @unchecked Sendable {
         }
         try? encoder.setSignal(.voice)
         try? encoder.setBitrate(Int32(format.opusBitrate))
-        try? encoder.setComplexity(5)
+        // Complexity 10: mono 48 kHz encode is ~1 % of a core either way on
+        // Apple silicon; matches stock Mumble / libopus reference clients.
+        try? encoder.setComplexity(10)
         try? encoder.setVBR(true)
         try? encoder.setInbandFEC(true)
         try? encoder.setPacketLossPercentage(Int32(targetLossPercent.load(ordering: .relaxed)))
         try? encoder.setLSBDepth(16)
         try? encoder.setDTX(false)      // our VAD is the single transmit gate
+        // Band-limited source (Bluetooth HFP mic at 8/16 kHz): cap the coded
+        // bandwidth to what the mic actually delivers so no bits are ever
+        // spent on empty spectrum above it.
+        if sourceRate <= 8_000 {
+            try? encoder.setMaxBandwidth(.narrowband)
+        } else if sourceRate <= 16_000 {
+            try? encoder.setMaxBandwidth(.wideband)
+        } else if sourceRate <= 24_000 {
+            try? encoder.setMaxBandwidth(.superwideband)
+        }
 
         var appliedBitrate = format.opusBitrate
         var appliedLoss = targetLossPercent.load(ordering: .relaxed)
@@ -199,6 +215,13 @@ public final class CaptureEngine: @unchecked Sendable {
         var sequence: UInt64 = 0
         var speaking = false
         var holdCount = 0
+
+        // VAD pre-roll: ring of the last N complete frames captured while
+        // idle, flushed (encoded + sent) the moment the VAD fires — so the
+        // quiet start of an utterance is transmitted instead of chopped.
+        let preRollFrames = max(0, format.vadPreRollMs / max(1, format.opusFrameMs))
+        var preRoll: [[Float]] = []
+        preRoll.reserveCapacity(preRollFrames)
 
         // Feeder state for AudioConverterFillComplexBuffer: hands the
         // converter the current raw chunk exactly once per call.
@@ -295,6 +318,9 @@ public final class CaptureEngine: @unchecked Sendable {
                     let threshold = Float(bitPattern: vadThresholdBits.load(ordering: .relaxed))
                     if muted {
                         holdCount = 0
+                        // Pre-roll holds real mic audio — never keep any
+                        // captured while muted.
+                        preRoll.removeAll(keepingCapacity: true)
                     } else if rms > threshold {
                         holdCount = holdFrames
                     } else if holdCount > 0 {
@@ -307,12 +333,37 @@ public final class CaptureEngine: @unchecked Sendable {
                         onSpeakingChanged?(nowSpeaking)
                         if nowSpeaking {
                             sequence = 0
+                            // Flush the onset that happened before the VAD
+                            // fired (oldest first, contiguous sequence).
+                            if transmitFlag.load(ordering: .relaxed) {
+                                for frame in preRoll {
+                                    frameBuffer.frameLength = AVAudioFrameCount(frameSamples)
+                                    frame.withUnsafeBufferPointer {
+                                        frameBuffer.floatChannelData![0]
+                                            .update(from: $0.baseAddress!, count: frameSamples)
+                                    }
+                                    if let len = try? encoder.encode(frameBuffer, to: &packetBytes),
+                                       len > 0 {
+                                        onPacket?(Data(packetBytes[0..<len]), sequence, false)
+                                        sequence &+= 1
+                                    }
+                                }
+                            }
+                            preRoll.removeAll(keepingCapacity: true)
                         } else if transmitFlag.load(ordering: .relaxed) {
                             onPacket?(Data(), sequence, true)   // terminator
                             sequence &+= 1
                         }
                     }
-                    guard speaking, transmitFlag.load(ordering: .relaxed) else { continue }
+                    guard speaking, transmitFlag.load(ordering: .relaxed) else {
+                        // Idle: remember this frame as potential onset.
+                        if !speaking, !muted, preRollFrames > 0 {
+                            if preRoll.count >= preRollFrames { preRoll.removeFirst() }
+                            preRoll.append(Array(UnsafeBufferPointer(start: accum,
+                                                                     count: frameSamples)))
+                        }
+                        continue
+                    }
 
                     frameBuffer.frameLength = AVAudioFrameCount(frameSamples)
                     frameBuffer.floatChannelData![0].update(from: accum, count: frameSamples)

@@ -62,6 +62,21 @@ public extension Opus.Encoder {
         try perform { cm_opus_encoder_set_prediction_disabled($0, disabled ? 1 : 0) }
     }
 
+    /// Audio bandwidth ceiling. Capping to the capture source's real
+    /// bandwidth stops the encoder spending bits on empty spectrum — at low
+    /// bitrates those bits noticeably improve the band that matters.
+    enum MaxBandwidth: Int32 {
+        case narrowband  = 1101   // 4 kHz  (8 kHz source)
+        case mediumband  = 1102   // 6 kHz  (12 kHz source)
+        case wideband    = 1103   // 8 kHz  (16 kHz source, BT HFP mic)
+        case superwideband = 1104 // 12 kHz (24 kHz source)
+        case fullband    = 1105   // 20 kHz (48 kHz source, default)
+    }
+
+    func setMaxBandwidth(_ bw: MaxBandwidth) throws {
+        try perform { cm_opus_encoder_set_max_bandwidth($0, bw.rawValue) }
+    }
+
     // MARK: - Internal
 
     private func perform(_ op: (UnsafeMutableRawPointer) -> Int32) throws {

@@ -41,6 +41,10 @@ int cm_opus_encoder_set_prediction_disabled(void *enc, int disabled) {
     return opus_encoder_ctl((OpusEncoder *)enc, OPUS_SET_PREDICTION_DISABLED(disabled ? 1 : 0));
 }
 
+int cm_opus_encoder_set_max_bandwidth(void *enc, int32_t bandwidth) {
+    return opus_encoder_ctl((OpusEncoder *)enc, OPUS_SET_MAX_BANDWIDTH(bandwidth));
+}
+
 int cm_opus_decode_float(void *dec,
                          const unsigned char *data, int32_t len,
                          float *pcm, int frame_size,

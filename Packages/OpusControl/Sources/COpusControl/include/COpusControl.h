@@ -20,6 +20,11 @@ int cm_opus_encoder_set_vbr(void *enc, int enabled);
 
 // Effective sample resolution hint, 8–24. 16 = standard 16-bit PCM source.
 int cm_opus_encoder_set_lsb_depth(void *enc, int32_t bits);
+// Cap the encoded audio bandwidth so bits aren't wasted on empty spectrum
+// when the capture source is band-limited (e.g. a 16 kHz Bluetooth HFP mic).
+// `bandwidth`: 1101 NB(4k) / 1102 MB(6k) / 1103 WB(8k) / 1104 SWB(12k) /
+// 1105 FB(20k) — the OPUS_BANDWIDTH_* constants.
+int cm_opus_encoder_set_max_bandwidth(void *enc, int32_t bandwidth);
 // Disable predictive coding (CELT only). 0 = predictor on (default), 1 = off.
 int cm_opus_encoder_set_prediction_disabled(void *enc, int disabled);
 
