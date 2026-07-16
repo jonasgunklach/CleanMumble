@@ -56,6 +56,10 @@ public final class NetJitterBuffer {
 
     private let maxConsecutivePLC = 25
     private let sampleRate = 48_000.0
+    /// Boundary crossfade span (~0.5 ms at 48 kHz) and the previous emitted
+    /// frame's last sample, used to smooth seams between frames.
+    private let crossfadeLen = 24
+    private var prevLastSample: Float?
 
     // Decode scratch (decode-worker thread only).
     private var pcmScratch = [Float](repeating: 0, count: 5_760)
@@ -138,6 +142,7 @@ public final class NetJitterBuffer {
         lastArrival = nil
         seqStep = 0
         pendingTerminator = false
+        prevLastSample = nil
         try? decoder.resetState()
     }
 
@@ -305,8 +310,37 @@ public final class NetJitterBuffer {
     }
 
     private func emit(_ n: Int) {
+        guard n > 0 else { return }
+        // Smooth the seam against the previously emitted frame before writing,
+        // so decode / FEC / PLC boundaries don't click.
+        if let prev = prevLastSample {
+            pcmScratch.withUnsafeMutableBufferPointer {
+                Self.applyBoundaryCorrection(UnsafeMutableBufferPointer(start: $0.baseAddress, count: n),
+                                             previousLast: prev, maxLen: crossfadeLen)
+            }
+        }
+        prevLastSample = pcmScratch[n - 1]
         pcmScratch.withUnsafeBufferPointer { buf in
             _ = ring.write(buf.baseAddress!, count: n)
+        }
+    }
+
+    /// Boundary-continuity correction (raised-cosine decay), adapted from
+    /// FancyMumble's `apply_crossfade_correction`. If the seam between the
+    /// previous frame's last sample and this frame's first sample jumps by
+    /// more than ~0.002, add a correction that starts at the full jump (so
+    /// sample 0 meets the previous tail exactly) and decays to zero over
+    /// `maxLen` samples. Removes clicks without overlap-add smearing; a no-op
+    /// when the seam is already continuous.
+    static func applyBoundaryCorrection(_ samples: UnsafeMutableBufferPointer<Float>,
+                                        previousLast: Float, maxLen: Int) {
+        guard let first = samples.first else { return }
+        let correction = previousLast - first
+        guard abs(correction) > 0.002 else { return }
+        let cf = min(maxLen, samples.count)
+        for i in 0..<cf {
+            let t = Float(i) / Float(cf)
+            samples[i] += correction * 0.5 * (1.0 + cosf(.pi * t))
         }
     }
 

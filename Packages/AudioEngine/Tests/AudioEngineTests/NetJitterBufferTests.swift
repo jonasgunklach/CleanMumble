@@ -42,6 +42,35 @@ final class NetJitterBufferTests: XCTestCase {
         }
     }
 
+    func testBoundaryCorrectionRemovesSeamDiscontinuity() {
+        // A frame that starts at 0 following a previous frame that ended at
+        // 0.5 — a hard 0.5 step (click). The correction must make sample 0
+        // meet 0.5 and decay to ~0 by the crossfade span, leaving the body
+        // untouched.
+        var samples = [Float](repeating: 0.0, count: 64)
+        for i in 0..<samples.count { samples[i] = 0.0 }   // flat frame at 0
+        samples.withUnsafeMutableBufferPointer {
+            NetJitterBuffer.applyBoundaryCorrection($0, previousLast: 0.5, maxLen: 24)
+        }
+        XCTAssertEqual(samples[0], 0.5, accuracy: 0.001, "sample 0 must meet the previous tail")
+        XCTAssertEqual(samples[24], 0.0, accuracy: 0.001, "correction must have decayed to zero by maxLen")
+        XCTAssertEqual(samples[40], 0.0, accuracy: 0.001, "body past the crossfade must be untouched")
+        // Monotonic decay across the span (no overshoot/ringing).
+        for i in 1..<24 {
+            XCTAssertLessThanOrEqual(samples[i], samples[i - 1] + 1e-6, "correction should decay monotonically")
+        }
+    }
+
+    func testBoundaryCorrectionNoOpWhenContinuous() {
+        var samples: [Float] = (0..<32).map { 0.1 + Float($0) * 0.001 }
+        let original = samples
+        samples.withUnsafeMutableBufferPointer {
+            // Previous tail ≈ first sample → seam already smooth → no change.
+            NetJitterBuffer.applyBoundaryCorrection($0, previousLast: 0.1005, maxLen: 24)
+        }
+        XCTAssertEqual(samples, original, "smooth seam must not be modified")
+    }
+
     func testInOrderPlayback() throws {
         let jb = NetJitterBuffer()!
         let packets = try makeOpusPackets(count: 10)
