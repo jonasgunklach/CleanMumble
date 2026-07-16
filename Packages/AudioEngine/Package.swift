@@ -22,6 +22,7 @@ let package = Package(
         .package(url: "https://github.com/alta/swift-opus", exact: "0.0.2"),
         .package(path: "../AudioCore"),
         .package(path: "../OpusControl"),
+        .package(path: "../RNNoise"),
     ],
     targets: [
         .target(
@@ -30,6 +31,7 @@ let package = Package(
                 .product(name: "Opus", package: "swift-opus"),
                 .product(name: "AudioCore", package: "AudioCore"),
                 .product(name: "OpusControl", package: "OpusControl"),
+                .product(name: "RNNoise", package: "RNNoise"),
             ],
             path: "Sources/AudioEngine",
             swiftSettings: [.swiftLanguageMode(.v5)]

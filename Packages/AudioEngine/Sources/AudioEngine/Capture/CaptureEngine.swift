@@ -16,6 +16,7 @@ import Synchronization
 import AudioCore
 import Opus
 import OpusControl
+import RNNoise
 
 /// Rebuild-class encoder settings — fixed for the lifetime of a `start()`.
 public struct CaptureFormat: Equatable, Sendable {
@@ -59,6 +60,15 @@ public final class CaptureEngine: @unchecked Sendable {
     public var isMuted: Bool {
         get { mutedFlag.load(ordering: .relaxed) }
         set { mutedFlag.store(newValue, ordering: .relaxed) }
+    }
+
+    /// RNNoise ML noise suppression, applied per 20 ms frame. Live-togglable:
+    /// the denoiser is always allocated on the worker; this gate decides
+    /// whether it runs, so switching it on/off never rebuilds the engine.
+    private let nsFlag = Atomic<Bool>(false)
+    public var noiseSuppressionEnabled: Bool {
+        get { nsFlag.load(ordering: .relaxed) }
+        set { nsFlag.store(newValue, ordering: .relaxed) }
     }
 
     /// When false, frames are gated by VAD only for the speaking indicator but
@@ -143,6 +153,12 @@ public final class CaptureEngine: @unchecked Sendable {
         // ---- Preallocate everything the loop touches --------------------
         let frameSamples = max(1, format.opusFrameMs) * 48        // @48 kHz
         let holdFrames = max(1, 300 / max(1, format.opusFrameMs)) // ~300 ms VAD hangover
+
+        // ML noise suppression (RNNoise). Allocated unconditionally so the
+        // `noiseSuppressionEnabled` toggle takes effect live; it processes
+        // fixed 480-sample (10 ms) sub-blocks, and every supported frame size
+        // (10/20/40/60 ms → 480/960/1920/2880) is a whole multiple of 480.
+        let denoiser = Denoiser()
 
         // Mumble's frame_number counts 10 ms audio SEGMENTS, not packets: the
         // receiver computes its jitter timestamp as frameSize(=480) × frame
@@ -309,6 +325,17 @@ public final class CaptureEngine: @unchecked Sendable {
                     consumed += take
                     guard accumCount == frameSamples else { continue }
                     accumCount = 0
+
+                    // 3.5) ML noise suppression on the completed frame, in
+                    // 480-sample blocks, before VAD/encode — so the VAD gates
+                    // on the cleaned signal and clean audio is transmitted.
+                    if let dn = denoiser, nsFlag.load(ordering: .relaxed) {
+                        var off = 0
+                        while off + 480 <= frameSamples {
+                            dn.process(accum.advanced(by: off))
+                            off += 480
+                        }
+                    }
 
                     // 4) VAD + encode + emit, one frame at a time.
                     // Mute is a hard gate: it ends the utterance instantly
