@@ -75,7 +75,6 @@ class MumbleViewModel: ObservableObject {
     // MARK: - Private Properties
     private var cancellables = Set<AnyCancellable>()
     private var audioEngine: AVAudioEngine?
-    private var mumbleProtocol: MumbleProtocolHandler?
     private var realMumbleClient: RealMumbleClient?
     /// Drives the @Published mic / output level properties at ~30 Hz while
     /// connected. Stopped on disconnect so we don't churn on the main thread.
