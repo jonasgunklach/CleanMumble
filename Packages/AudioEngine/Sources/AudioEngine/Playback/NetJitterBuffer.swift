@@ -43,6 +43,16 @@ public final class NetJitterBuffer {
     private var consecutivePLC = 0
     private var frameSize = 960                    // samples @48 kHz, learned from stream
     private var lastUnderruns = 0
+    /// A terminator arrived but there was still buffered audio to play. We
+    /// finish draining it before resetting, so the last syllable isn't cut
+    /// when the terminator shares a TCP batch with the final audio frames.
+    private var pendingTerminator = false
+    /// The sender's frame_number stride. Mumble counts 10 ms segments, so a
+    /// 20 ms-frame sender steps by 2, 40 ms by 4. 0 = not yet learned; until
+    /// then we assume 1. Assuming 1 against a step-2 sender makes every packet
+    /// look like it has a lost neighbour → ~50 % spurious FEC → 2× stretched
+    /// "robot" audio and phantom packet loss in the stats.
+    private var seqStep: UInt32 = 0
 
     private let maxConsecutivePLC = 25
     private let sampleRate = 48_000.0
@@ -81,7 +91,16 @@ public final class NetJitterBuffer {
         }
         lastArrival = now
 
-        if let nxt = nextSeq, seq < nxt, nxt - seq > 8 { return }   // ancient
+        // A new utterance started (sequence restarts near 0) before the
+        // previous terminator finished draining — finalize the old one now so
+        // its stale nextSeq/stride don't reject the fresh stream as ancient.
+        if pendingTerminator, let nxt = nextSeq, seq < nxt {
+            hardResetLocked()
+        }
+
+        // Ancient-packet drop, scaled by the sender's stride so the window is
+        // ~8 frames regardless of frame size.
+        if let nxt = nextSeq, seq < nxt, nxt - seq > 8 * max(1, seqStep) { return }
         packets[seq] = opus
 
         if nextSeq == nil {
@@ -91,14 +110,34 @@ public final class NetJitterBuffer {
         }
     }
 
-    /// Terminator packet / speaker switch: end the utterance cleanly.
+    /// Hard reset — drop everything immediately (disconnect / speaker switch).
     public func reset() {
         lock.lock(); defer { lock.unlock() }
+        hardResetLocked()
+    }
+
+    /// Terminator: the sender finished this utterance. If there's still
+    /// buffered audio in flight, defer the reset until the decode worker has
+    /// drained it (so the last syllable isn't clipped when the terminator
+    /// arrives in the same TCP batch as the final frames); otherwise reset now.
+    public func terminate() {
+        lock.lock(); defer { lock.unlock() }
+        if nextSeq == nil && packets.isEmpty {
+            hardResetLocked()
+        } else {
+            pendingTerminator = true
+        }
+    }
+
+    /// Must be called with `lock` held.
+    private func hardResetLocked() {
         packets.removeAll(keepingCapacity: true)
         nextSeq = nil
         buffering = false
         consecutivePLC = 0
         lastArrival = nil
+        seqStep = 0
+        pendingTerminator = false
         try? decoder.resetState()
     }
 
@@ -162,7 +201,9 @@ public final class NetJitterBuffer {
 
     private func decideNextAction() -> Action {
         lock.lock(); defer { lock.unlock() }
+        detectSeqStep()
         guard let want = nextSeq else { return .ended }
+        let step = max(1, seqStep)
         let now = Self.monotonicNow()
 
         // Initial buffering: hold until the deadline unless enough audio is
@@ -178,15 +219,23 @@ public final class NetJitterBuffer {
         if ring.availableToRead >= aheadTarget { return .none }
 
         if let p = packets.removeValue(forKey: want) {
-            nextSeq = want &+ 1
+            nextSeq = want &+ step
             consecutivePLC = 0
-            gc(playhead: want &+ 1)
+            gc(playhead: want &+ step)
             return .play(p)
         }
-        if let next = packets[want &+ 1] {
-            nextSeq = want &+ 1
+        // The next packet (want + step) carries in-band FEC for `want`.
+        if let next = packets[want &+ step] {
+            nextSeq = want &+ step
             consecutivePLC = 0
             return .fec(next)
+        }
+        // Terminator already received and everything buffered has drained →
+        // clean end, no PLC tail. (If packets remain past a gap we fall through
+        // and bridge to them so they aren't cut.)
+        if pendingTerminator, packets.isEmpty {
+            hardResetLocked()
+            return .ended
         }
         // Neither present. Only conceal once the packet is genuinely late.
         let frameMs = Double(frameSize) / sampleRate * 1000
@@ -200,10 +249,32 @@ public final class NetJitterBuffer {
                 consecutivePLC = 0
                 return .ended
             }
-            nextSeq = want &+ 1
+            nextSeq = want &+ step
             return .plc
         }
         return .none
+    }
+
+    /// Learn the sender's frame_number stride from the buffered packets. Uses
+    /// the smallest positive gap between queued sequence numbers (robust to a
+    /// dropped first packet or light reordering), so one detection survives
+    /// the whole utterance. Must be called with `lock` held.
+    private func detectSeqStep() {
+        guard seqStep == 0, packets.count >= 2 else { return }
+        let keys = packets.keys.sorted()
+        var minGap = UInt32.max
+        for i in 1..<keys.count {
+            let g = keys[i] &- keys[i - 1]
+            if g > 0 { minGap = min(minGap, g) }
+        }
+        guard minGap >= 1, minGap <= 8 else { return }
+        seqStep = minGap
+        // The drain loop may have advanced nextSeq by the provisional stride
+        // of 1 before we knew the real one — snap it back onto the sender's
+        // grid so we stop chasing sequence numbers that will never arrive.
+        if let nxt = nextSeq, let base = keys.first, nxt >= base {
+            nextSeq = base &+ ((nxt &- base) / minGap) &* minGap
+        }
     }
 
     private func gc(playhead: UInt32) {

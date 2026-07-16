@@ -184,7 +184,10 @@ public final class PlaybackEngine: @unchecked Sendable {
         guard let ch = channel else { return }
         ch.lastActivity.store(DispatchTime.now().uptimeNanoseconds, ordering: .relaxed)
         if isTerminator {
-            ch.jitter.reset()
+            // Defer the reset until buffered audio drains (avoids clipping the
+            // last syllable); the decode worker finalizes it.
+            ch.jitter.terminate()
+            wakeup.signal()
         } else {
             ch.jitter.push(seq: seq, opus: opus)
             wakeup.signal()

@@ -302,6 +302,10 @@ class RealMumbleClient: ObservableObject {
         let tcp = NWProtocolTCP.Options()
         tcp.enableKeepalive = true
         tcp.keepaliveIdle   = 30
+        // Voice frames are tiny and latency-critical; Nagle would coalesce
+        // them and add up to ~40 ms of head-of-line delay on the UDPTunnel
+        // (TCP) voice fallback path.
+        tcp.noDelay = true
 
         let params = NWParameters(tls: tls, tcp: tcp)
         let conn   = NWConnection(to: endpoint, using: params)

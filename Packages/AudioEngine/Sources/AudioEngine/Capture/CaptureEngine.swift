@@ -144,6 +144,13 @@ public final class CaptureEngine: @unchecked Sendable {
         let frameSamples = max(1, format.opusFrameMs) * 48        // @48 kHz
         let holdFrames = max(1, 300 / max(1, format.opusFrameMs)) // ~300 ms VAD hangover
 
+        // Mumble's frame_number counts 10 ms audio SEGMENTS, not packets: the
+        // receiver computes its jitter timestamp as frameSize(=480) × frame
+        // _number. A 20 ms Opus frame therefore advances the sequence by 2,
+        // 40 ms by 4, etc. Sending +1 per packet makes every standard client
+        // (Linux / iOS Mumble) play us back at 2× → robot voice.
+        let seqStep = UInt64(max(1, format.opusFrameMs / 10))
+
         let hpf = BiquadFilter(format: .mumble,
                                coeffs: BiquadFilter.highPass(cutoffHz: 80,
                                                              sampleRate: 48_000,
@@ -345,14 +352,14 @@ public final class CaptureEngine: @unchecked Sendable {
                                     if let len = try? encoder.encode(frameBuffer, to: &packetBytes),
                                        len > 0 {
                                         onPacket?(Data(packetBytes[0..<len]), sequence, false)
-                                        sequence &+= 1
+                                        sequence &+= seqStep
                                     }
                                 }
                             }
                             preRoll.removeAll(keepingCapacity: true)
                         } else if transmitFlag.load(ordering: .relaxed) {
                             onPacket?(Data(), sequence, true)   // terminator
-                            sequence &+= 1
+                            sequence &+= seqStep
                         }
                     }
                     guard speaking, transmitFlag.load(ordering: .relaxed) else {
@@ -369,7 +376,7 @@ public final class CaptureEngine: @unchecked Sendable {
                     frameBuffer.floatChannelData![0].update(from: accum, count: frameSamples)
                     if let len = try? encoder.encode(frameBuffer, to: &packetBytes), len > 0 {
                         onPacket?(Data(packetBytes[0..<len]), sequence, false)
-                        sequence &+= 1
+                        sequence &+= seqStep
                     }
                 }
             }
