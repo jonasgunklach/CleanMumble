@@ -232,6 +232,11 @@ class RealMumbleClient: ObservableObject {
     var loopbackEnabled: Bool = false {
         didSet { voiceTX.setLoopback(loopbackEnabled) }
     }
+    /// RNNoise ML noise suppression on the mic. Live-toggleable; stacks on top
+    /// of VPIO's own NS on the voice path, and is the only NS on the raw path.
+    var noiseSuppression: Bool = true {
+        didSet { voiceEngine.capture.noiseSuppressionEnabled = noiseSuppression }
+    }
     /// Timers to reset remote users' isSpeaking after audio stops arriving.
     private var speakingTimers: [Int32: Timer] = [:]
 
@@ -1185,6 +1190,7 @@ class RealMumbleClient: ObservableObject {
         voiceEngine.capture.vadThreshold = vadThreshold
         voiceEngine.capture.inputGain.target = max(0, min(8, inputGain))
         voiceEngine.capture.isMuted = isMuted
+        voiceEngine.capture.noiseSuppressionEnabled = noiseSuppression
         voiceEngine.playback.isDeafened = isDeafened
         voiceEngine.capture.transmitEnabled = true
         voiceEngine.start(config: currentAudioConfig())

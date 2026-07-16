@@ -268,6 +268,7 @@ class MumbleViewModel: ObservableObject {
             client.opusLowDelay = s.quality.lowDelay
             client.voiceProcessingMode = s.voiceProcessing.toProcessingMode
             client.enableAGC = s.enableAutomaticGainControl
+            client.noiseSuppression = s.enableNoiseSuppression
             client.vadThreshold = 0.001 + Float(s.voiceActivityThreshold) * 0.049
             client.inputGain = s.inputVolume
         }
@@ -372,6 +373,7 @@ class MumbleViewModel: ObservableObject {
             client.opusLowDelay = settings.quality.lowDelay
             client.voiceProcessingMode = settings.voiceProcessing.toProcessingMode
             client.enableAGC = settings.enableAutomaticGainControl
+            client.noiseSuppression = settings.enableNoiseSuppression
             // Map slider 0…1 → RMS 0.001 (very sensitive) … 0.05 (loud only).
             // Mumble-style voice activation: anything below the threshold is
             // treated as silence and not transmitted.
