@@ -206,6 +206,11 @@ class RealMumbleClient: ObservableObject {
     var opusBitrate:  Int  = 40000   // bits/s
     var opusFrameMs:  Int  = 20      // 10 / 20 / 40 / 60 ms
     var opusLowDelay: Bool = false   // restricted low-delay application mode
+
+    /// The server's advertised `max_bandwidth` (bits/s, incl. packet overhead)
+    /// from ServerSync. 0 = unknown / unlimited. We MUST keep our transmit
+    /// bandwidth under this or the server throttles/drops our audio.
+    private var serverMaxBandwidth: Int = 0
     /// Processing mode. `.auto` (default): voice processing (AEC + NS + AGC)
     /// for built-in / USB / Bluetooth — including AirPods, where VPIO is what
     /// unlocks the high-bandwidth voice link — raw AUHAL for aggregate /
@@ -505,6 +510,7 @@ class RealMumbleClient: ObservableObject {
         sessionId       = session
         connectionState = .connected
         isConnected     = true
+        serverMaxBandwidth = Int(maxBW)
         serverInfo      = ServerInfo(name: serverHost, version: "1.x", release: "",
                                      os: "", osVersion: "", welcomeText: welcome,
                                      maxBandwidth: Int(maxBW))
@@ -1109,8 +1115,9 @@ class RealMumbleClient: ObservableObject {
         currentJitterDepthMs = Int(jb.maxDepthMs)
 
         // Bitrate ladder. The user's `opusBitrate` setting is the BASELINE
-        // (used at low loss); we only step DOWN from there as loss climbs.
-        let baseline = opusBitrate
+        // (used at low loss), but never above what the server's max_bandwidth
+        // permits; we only step DOWN from there as loss climbs.
+        let baseline = min(opusBitrate, serverBitrateCeiling())
         let target: Int
         switch clampedLoss {
         case 0...2:   target = baseline
@@ -1118,9 +1125,29 @@ class RealMumbleClient: ObservableObject {
         case 9...20:  target = max(20_000, baseline / 2)         // ~50%
         default:      target = max(16_000, baseline * 3 / 10)    // ~30%
         }
-        voiceEngine.capture.setNetworkAdaptation(bitrate: target,
+        // Clamp again: the reduced-loss tiers floor at fixed values that could
+        // still exceed a very restrictive server cap.
+        let effective = min(target, serverBitrateCeiling())
+        voiceEngine.capture.setNetworkAdaptation(bitrate: effective,
                                                  lossPercent: max(5, clampedLoss))
-        currentEncoderBitrate = target
+        currentEncoderBitrate = effective
+    }
+
+    /// The highest Opus bitrate whose total wire bandwidth stays under the
+    /// server's advertised `max_bandwidth`. Mirrors Mumble's own
+    /// `AudioInput::getNetworkBandwidth`: total = opus bitrate + per-packet
+    /// overhead × packets-per-second, where a packet carries `frames` 10 ms
+    /// segments. Inverting gives the Opus ceiling. Returns `Int.max` when the
+    /// server advertised no limit.
+    private func serverBitrateCeiling() -> Int {
+        guard serverMaxBandwidth > 0 else { return Int.max }
+        let frames = max(1, opusFrameMs / 10)                 // 10 ms segments per packet
+        // Bytes of overhead per packet: IP(20)+UDP(8)+OCB2 crypt(4)+type/target
+        // (1)+sequence varint(≈2)+Opus length varint(≈2).
+        let overheadBytes = 20 + 8 + 4 + 1 + 2 + 2
+        // ×8 bits, ×(100/frames) packets per second.
+        let overheadBits = overheadBytes * 8 * 100 / frames
+        return max(8_000, serverMaxBandwidth - overheadBits)
     }
 
     private func sendPing() {
@@ -1188,7 +1215,7 @@ class RealMumbleClient: ObservableObject {
         c.output = DeviceSelection(uid: outputDeviceUID)
         c.processing = voiceProcessingMode
         c.agcEnabled = enableAGC
-        c.capture = CaptureFormat(opusBitrate: opusBitrate,
+        c.capture = CaptureFormat(opusBitrate: min(opusBitrate, serverBitrateCeiling()),
                                   opusFrameMs: opusFrameMs,
                                   opusLowDelay: opusLowDelay)
         return c
