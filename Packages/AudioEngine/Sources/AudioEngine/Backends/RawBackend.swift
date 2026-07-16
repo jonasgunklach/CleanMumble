@@ -42,6 +42,10 @@ final class RawBackend: IOBackend {
         self.playback = playback
         do {
             let inputRate = try startInput(device: route.inputID)
+            let band = inputRate <= 16_000 ? "wideband(8k)"
+                     : inputRate <= 24_000 ? "superwideband(12k)" : "fullband"
+            print(String(format: "[Audio] Raw backend: mic native %.0f Hz → Opus cap %@",
+                         inputRate, band))
             capture.start(sourceRate: inputRate, format: captureFormat)
             try startOutput(device: route.outputID)
         } catch {

@@ -71,7 +71,19 @@ final class VoiceBackend: IOBackend {
 
         // 5) Capture: worker resamples device rate → 48 kHz, so the tap just
         //    forwards mono samples.
+        // Diagnostic: the negotiated mic rate decides the Opus coded-bandwidth
+        // cap (≤16 k→wideband/8 kHz, ≤24 k→superwideband/12 kHz, else
+        // fullband). If AirPods collapse to a low HFP rate here, voice is
+        // legitimately band-limited — this is the number to check when someone
+        // reports "muffled".
+        let band = inFormat.sampleRate <= 16_000 ? "wideband(8k)"
+                 : inFormat.sampleRate <= 24_000 ? "superwideband(12k)" : "fullband"
+        print(String(format: "[Audio] VPIO negotiated: in %.0f Hz %uch, out %.0f Hz → Opus cap %@",
+                     inFormat.sampleRate, inFormat.channelCount,
+                     outNodeFormat.sampleRate, band))
         capture.start(sourceRate: inFormat.sampleRate, format: captureFormat)
+        // VPIO can hand us a multi-channel buffer (observed 3ch on AirPods,
+        // all channels identical); channel 0 is the processed near-end voice.
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { buf, _ in
             guard let ch0 = buf.floatChannelData?[0] else { return }
             capture.ingest(ch0, count: Int(buf.frameLength))
