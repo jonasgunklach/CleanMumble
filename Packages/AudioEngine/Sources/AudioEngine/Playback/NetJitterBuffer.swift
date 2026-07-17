@@ -243,9 +243,16 @@ public final class NetJitterBuffer {
             return .ended
         }
         // Neither present. Only conceal once the packet is genuinely late.
+        // Adaptive stale threshold (from FancyMumble/bnfone): a fixed 1.5×
+        // frame (30 ms) fires PLC on mild jitter, and once nextSeq advances the
+        // real packet arrives "ancient" and is dropped → the utterance plays in
+        // fewer frames and sounds sped-up. Scale the threshold with the
+        // measured jitter depth so a slightly-late packet is waited for, not
+        // concealed-and-discarded.
         let frameMs = Double(frameSize) / sampleRate * 1000
+        let staleMs = max(2 * frameMs, 0.75 * targetDepthMs)
         let sinceArrival = (lastArrival.map { (now - $0) * 1000 }) ?? .infinity
-        if sinceArrival > frameMs * 1.5 {
+        if sinceArrival > staleMs {
             consecutivePLC += 1
             if consecutivePLC > maxConsecutivePLC {
                 // Sender stopped without a terminator: end the utterance.
