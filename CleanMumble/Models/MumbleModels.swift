@@ -119,7 +119,11 @@ struct AudioSettings: Codable {
     var inputDevice: String = "Default"
     var outputDevice: String = "Default"
     var enableEchoCancellation: Bool = true
-    var enableNoiseSuppression: Bool = true
+    /// RNNoise ML noise suppression. Default OFF: on the voice-processing path
+    /// it stacks on Apple VPIO's own NS (double-processing → intermittent
+    /// scratchiness); it's a clear win only on the raw/studio path. Opt in via
+    /// Settings → Noise Suppression.
+    var enableNoiseSuppression: Bool = false
     var enableAutomaticGainControl: Bool = true
     var voiceActivityDetection: Bool = true
     var voiceActivityThreshold: Float = 0.5
@@ -148,7 +152,7 @@ struct AudioSettings: Codable {
         self.inputDevice = try c.decodeIfPresent(String.self, forKey: .inputDevice) ?? "Default"
         self.outputDevice = try c.decodeIfPresent(String.self, forKey: .outputDevice) ?? "Default"
         self.enableEchoCancellation = try c.decodeIfPresent(Bool.self, forKey: .enableEchoCancellation) ?? true
-        self.enableNoiseSuppression = try c.decodeIfPresent(Bool.self, forKey: .enableNoiseSuppression) ?? true
+        self.enableNoiseSuppression = try c.decodeIfPresent(Bool.self, forKey: .enableNoiseSuppression) ?? false
         self.enableAutomaticGainControl = try c.decodeIfPresent(Bool.self, forKey: .enableAutomaticGainControl) ?? true
         self.voiceActivityDetection = try c.decodeIfPresent(Bool.self, forKey: .voiceActivityDetection) ?? true
         self.voiceActivityThreshold = try c.decodeIfPresent(Float.self, forKey: .voiceActivityThreshold) ?? 0.5
